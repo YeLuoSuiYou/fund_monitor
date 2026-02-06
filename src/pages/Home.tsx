@@ -62,6 +62,7 @@ export default function Home() {
   const quoteSourceId = useSettingsStore((s) => s.quoteSourceId)
   const customQuoteUrlTemplate = useSettingsStore((s) => s.customQuoteUrlTemplate)
   const holdingsApiBaseUrl = useSettingsStore((s) => s.holdingsApiBaseUrl)
+  const valuationMode = useSettingsStore((s) => s.valuationMode)
   const decimals = useSettingsStore((s) => s.decimals)
   const colorRule = useSettingsStore((s) => s.colorRule)
   const viewMode = useSettingsStore((s) => s.viewMode) || "standard"
@@ -126,8 +127,13 @@ export default function Home() {
   useEffect(() => {
     if (!canFetch) return
     if (status === "idle")
-      refreshAll(normalizedCodes, { quoteSourceId: effectiveSourceId, customQuoteTemplate: customTemplate, holdingsApiBaseUrl })
-  }, [canFetch, normalizedCodes, refreshAll, status, effectiveSourceId, customTemplate, holdingsApiBaseUrl])
+      refreshAll(normalizedCodes, {
+        quoteSourceId: effectiveSourceId,
+        customQuoteTemplate: customTemplate,
+        holdingsApiBaseUrl,
+        valuationMode,
+      })
+  }, [canFetch, normalizedCodes, refreshAll, status, effectiveSourceId, customTemplate, holdingsApiBaseUrl, valuationMode])
 
   useEffect(() => {
     if (!canFetch) return
@@ -136,10 +142,26 @@ export default function Home() {
 
     const ms = Math.max(5, refreshIntervalSec || 30) * 1000
     const id = window.setInterval(() => {
-      refreshAll(normalizedCodes, { quoteSourceId: effectiveSourceId, customQuoteTemplate: customTemplate, holdingsApiBaseUrl })
+      refreshAll(normalizedCodes, {
+        quoteSourceId: effectiveSourceId,
+        customQuoteTemplate: customTemplate,
+        holdingsApiBaseUrl,
+        valuationMode,
+      })
     }, ms)
     return () => window.clearInterval(id)
-  }, [autoRefreshEnabled, canFetch, normalizedCodes, refreshAll, refreshIntervalSec, effectiveSourceId, customTemplate, holdingsApiBaseUrl, marketStatus.isOpen])
+  }, [
+    autoRefreshEnabled,
+    canFetch,
+    normalizedCodes,
+    refreshAll,
+    refreshIntervalSec,
+    effectiveSourceId,
+    customTemplate,
+    holdingsApiBaseUrl,
+    marketStatus.isOpen,
+    valuationMode,
+  ])
 
   // 大盘指数刷新逻辑
   useEffect(() => {
@@ -236,7 +258,10 @@ export default function Home() {
     return `行情源：${activeLabel}`
   }, [effectiveSourceId])
 
-  const modelLabel = "估值口径：重仓股+现金"
+  const modelLabel = useMemo(() => {
+    const modeLabel = valuationMode === "official" ? "官方" : valuationMode === "holdings" ? "持仓" : "智能"
+    return `估值口径：${modeLabel}`
+  }, [valuationMode])
   const errorHint = useMemo(() => {
     if (status !== "error") return null
     if (errorMessage?.includes("网络")) return "网络异常，已暂停刷新，恢复后自动重试"
@@ -298,7 +323,14 @@ export default function Home() {
             <Button
               variant="primary"
               size="sm"
-              onClick={() => refreshAll(normalizedCodes, { quoteSourceId: effectiveSourceId, customQuoteTemplate: customTemplate, holdingsApiBaseUrl })}
+              onClick={() =>
+                refreshAll(normalizedCodes, {
+                  quoteSourceId: effectiveSourceId,
+                  customQuoteTemplate: customTemplate,
+                  holdingsApiBaseUrl,
+                  valuationMode,
+                })
+              }
               disabled={!canFetch || status === "loading"}
             >
               <RefreshCw className={"h-4 w-4 " + (status === "loading" ? "animate-spin" : "")} />
@@ -326,7 +358,14 @@ export default function Home() {
               <div className="mt-4">
                 <Button
                   variant="secondary"
-                  onClick={() => refreshAll(normalizedCodes, { quoteSourceId: effectiveSourceId, customQuoteTemplate: customTemplate, holdingsApiBaseUrl })}
+                  onClick={() =>
+                    refreshAll(normalizedCodes, {
+                      quoteSourceId: effectiveSourceId,
+                      customQuoteTemplate: customTemplate,
+                      holdingsApiBaseUrl,
+                      valuationMode,
+                    })
+                  }
                   disabled={!canFetch}
                 >
                   重试（刷新全部）

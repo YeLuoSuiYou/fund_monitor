@@ -112,11 +112,27 @@ export default function FundDetail() {
     
     // 如果没有 5min 序列数据，但有今日实时涨跌幅，构造一个点以防止图表空白
     if (period === "INTRADAY") {
-      let points = [...intraday].filter((p) => {
+      const allPoints = [...intraday]
+      let points = allPoints.filter((p) => {
         if (!latest?.valuationSource) return true
         return !p.source || p.source === latest.valuationSource
       })
       
+      // 如果当前口径的点位太少（比如官方估值只有 1 个点），则尝试使用持仓口径的点位作为趋势参考
+      if (points.length < 5 && latest?.valuationSource === "eastmoney") {
+        const holdingsPoints = allPoints.filter(p => p.source === "holdings")
+        if (holdingsPoints.length >= 5) {
+          // 使用持仓点位作为底色，但我们需要平移它们，使得最后一个点对齐当前的官方估值
+          const lastHoldingsVal = holdingsPoints[holdingsPoints.length - 1].value
+          const offset = (latest.gszzl ?? lastHoldingsVal) - lastHoldingsVal
+          points = holdingsPoints.map(p => ({
+            ...p,
+            value: p.value + offset,
+            source: "eastmoney_fallback"
+          }))
+        }
+      }
+
       if (latest?.gszzl != null && latest?.gztime?.includes(todayStr)) {
         // 提取 gztime 中的 HH:mm
         const timeMatch = latest.gztime.match(/\d{2}:\d{2}/)

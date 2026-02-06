@@ -45,6 +45,18 @@ stock_info_cache = {} # 缓存股票所属行业等信息
 user_settings_data = {} # 存储基金列表等用户配置
 intraday_history_data = {} # 存储日内估值点 { code: { date: [ { time, value } ] } }
 data_lock = threading.Lock()
+ak_lock = threading.Lock() # 专门用于保护 akshare 调用，防止 mini_racer 崩溃
+
+def call_ak(func, *args, **kwargs):
+    """
+    带锁调用 akshare 接口，确保线程安全并防止 V8 崩溃
+    """
+    with ak_lock:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"akshare call error ({func.__name__}): {e}")
+            return None
 
 def load_persistent_cache():
     global cache_store, fund_info_cache, stock_info_cache, user_settings_data, intraday_history_data
@@ -84,6 +96,100 @@ def load_persistent_cache():
                 logger.info(f"Loaded intraday history for {len(intraday_history_data)} funds")
         except Exception as e:
             logger.error(f"Error loading intraday history: {e}")
+
+# 准确度记录
+accuracy_history_data = {} # { code: { date: { "eastmoney": error, "holdings": error } } }
+ACCURACY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "accuracy_history.json")
+
+def load_accuracy_history():
+    global accuracy_history_data
+    if os.path.exists(ACCURACY_HISTORY_FILE):
+        try:
+            with open(ACCURACY_HISTORY_FILE, "r") as f:
+                accuracy_history_data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load accuracy history: {e}")
+            accuracy_history_data = {}
+
+def save_accuracy_history():
+    try:
+        with open(ACCURACY_HISTORY_FILE, "w") as f:
+            json.dump(accuracy_history_data, f)
+    except Exception as e:
+        logger.error(f"Failed to save accuracy history: {e}")
+
+load_accuracy_history()
+
+def record_accuracy(code: str, target_date: str, actual_zzl: float):
+    """
+    计算并记录该基金在该日期的估值准确度
+    """
+    with data_lock:
+        fund_history = intraday_history_data.get(code, {})
+        day_points = fund_history.get(target_date, [])
+        if not day_points:
+            return
+
+        # 寻找接近 15:00 的点
+        eastmoney_final = None
+        holdings_final = None
+        
+        # 按时间排序，找最接近收盘的点
+        sorted_pts = sorted(day_points, key=lambda x: x["time"])
+        for pt in reversed(sorted_pts):
+            t = pt["time"]
+            if t > "15:05": continue # 忽略盘后点
+            
+            src = pt.get("source", "holdings")
+            val = pt["value"]
+            if src == "eastmoney" and eastmoney_final is None:
+                eastmoney_final = val
+            elif src == "holdings" and holdings_final is None:
+                holdings_final = val
+            
+            if eastmoney_final is not None and holdings_final is not None:
+                break
+        
+        errors = {}
+        if eastmoney_final is not None:
+            errors["eastmoney"] = abs(eastmoney_final - actual_zzl)
+        if holdings_final is not None:
+            errors["holdings"] = abs(holdings_final - actual_zzl)
+            
+        if errors:
+            if code not in accuracy_history_data:
+                accuracy_history_data[code] = {}
+            accuracy_history_data[code][target_date] = errors
+            save_accuracy_history()
+            logger.info(f"Recorded accuracy for {code} on {target_date}: {errors}")
+
+def get_best_source(code: str) -> str:
+    """
+    根据历史准确度，返回该基金建议的估值来源
+    """
+    with data_lock:
+        history = accuracy_history_data.get(code, {})
+        if not history:
+            return "eastmoney" # 默认官方
+            
+        # 取最近 5 个有记录的交易日
+        sorted_dates = sorted(history.keys(), reverse=True)[:5]
+        
+        east_errors = []
+        hold_errors = []
+        
+        for d in sorted_dates:
+            errs = history[d]
+            if "eastmoney" in errs: east_errors.append(errs["eastmoney"])
+            if "holdings" in errs: hold_errors.append(errs["holdings"])
+            
+        if not east_errors: return "holdings"
+        if not hold_errors: return "eastmoney"
+        
+        avg_east = sum(east_errors) / len(east_errors)
+        avg_hold = sum(hold_errors) / len(hold_errors)
+        
+        return "holdings" if avg_hold < avg_east else "eastmoney"
 
 def save_persistent_cache():
     try:
@@ -139,7 +245,7 @@ def get_fund_name(code: str):
         logger.info(f"Fetching fund name for {code}")
         # 尝试多个接口获取名称
         try:
-            df = ak.fund_individual_basic_info_xq(symbol=code)
+            df = call_ak(ak.fund_individual_basic_info_xq, symbol=code)
             if df is not None and not df.empty:
                 name_row = df[df["item"] == "基金名称"]
                 if not name_row.empty:
@@ -151,7 +257,7 @@ def get_fund_name(code: str):
 
         try:
             # 备选：天天基金列表
-            df = ak.fund_open_fund_daily_em()
+            df = call_ak(ak.fund_open_fund_daily_em)
             if df is not None and not df.empty:
                 col_code = pick_col(df.columns, ["基金代码", "代码"])
                 col_name = pick_col(df.columns, ["基金简称", "名称"])
@@ -190,7 +296,9 @@ def find_target_etf_code(feeder_code: str, feeder_name: str):
 
     try:
         if _all_funds_df is None:
-            _all_funds_df = ak.fund_name_em()
+            _all_funds_df = call_ak(ak.fund_name_em)
+
+        if _all_funds_df is None: return None
 
         # 搜索简称中包含 target_name 且不含“联接”的指数型基金
         mask = (_all_funds_df['基金简称'].str.contains(target_name)) & \
@@ -217,7 +325,7 @@ def parse_actual_data(code: str):
         
         # 优先尝试从每日净值更新列表获取，这个通常更新最快
         try:
-            df_daily = ak.fund_open_fund_daily_em()
+            df_daily = call_ak(ak.fund_open_fund_daily_em)
             if df_daily is not None and not df_daily.empty:
                 col_code = pick_col(df_daily.columns, ["基金代码", "代码"])
                 match = df_daily[df_daily[col_code] == code]
@@ -258,7 +366,7 @@ def parse_actual_data(code: str):
             logger.warning(f"Error fetching from daily list for {code}: {e}")
 
         # 备选：从单位净值走势获取
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        df = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
         if df is not None and not df.empty:
             last_row = df.iloc[-1]
             # 找到列
@@ -310,7 +418,7 @@ def get_stock_industry(symbol: str):
         # 仅对 6 位数字代码尝试获取行业（A股）
         if len(symbol) == 6 and symbol.isdigit():
             logger.info(f"Fetching industry for stock {symbol}")
-            df = ak.stock_individual_info_em(symbol=symbol)
+            df = call_ak(ak.stock_individual_info_em, symbol=symbol)
             if df is not None and not df.empty:
                 row = df[df["item"] == "行业"]
                 if not row.empty:
@@ -329,7 +437,7 @@ def parse_latest_holdings(code: str, is_recursive=False):
     for year in [current_year, current_year - 1, current_year - 2]:
         try:
             logger.info(f"Fetching holdings for {code} year {year}")
-            df = ak.fund_portfolio_hold_em(symbol=code, date=str(year))
+            df = call_ak(ak.fund_portfolio_hold_em, symbol=code, date=str(year))
             if df is None or df.empty:
                 logger.warning(f"No holdings data for {code} in {year}")
                 continue
@@ -445,7 +553,7 @@ def parse_cash_ratio(code: str):
 def parse_base_nav(code: str) -> Optional[tuple[float, str, Optional[dict]]]:
     try:
         logger.info(f"Fetching base nav for {code}")
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        df = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
         if df is None or df.empty:
             logger.warning(f"No nav data for {code}")
             return None
@@ -556,6 +664,10 @@ def refresh_nav_snapshot(code: str, data: dict, now: float) -> dict:
         refreshed["actualZzl"] = actual_info.get("actualZzl")
         refreshed["actualDate"] = actual_info.get("actualDate")
         refreshed["actualNav"] = actual_info.get("actualNav")
+        # 记录准确度
+        if refreshed["actualZzl"] is not None and refreshed["actualDate"]:
+            record_accuracy(code, refreshed["actualDate"], refreshed["actualZzl"])
+    refreshed["navCheckedAt"] = now
     return refreshed
 
 
@@ -634,7 +746,7 @@ def get_holdings(code: str):
 def get_fund_history(code: str):
     try:
         logger.info(f"Fetching history for {code}")
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        df = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
         if df is not None and not df.empty:
             col_date = pick_col(df.columns, ["净值日期", "日期"])
             col_nav = pick_col(df.columns, ["单位净值", "净值"])
@@ -700,18 +812,18 @@ def backfill_intraday_history(code: str):
                 
                 # A 股 6 位数字
                 if len(symbol) == 6 and symbol.isdigit():
-                    df = ak.stock_zh_a_hist_min_em(symbol=symbol, period='5', adjust='qfq')
-                    df_daily = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+                    df = call_ak(ak.stock_zh_a_hist_min_em, symbol=symbol, period='5', adjust='qfq')
+                    df_daily = call_ak(ak.stock_zh_a_hist, symbol=symbol, period="daily", adjust="qfq")
                 # 港股 1-5 位数字 (自动补齐 5 位)
                 elif 1 <= len(symbol) <= 5 and symbol.isdigit():
                     hk_symbol = symbol.zfill(5)
-                    df = ak.stock_hk_hist_min_em(symbol=hk_symbol, period='5', adjust='qfq')
-                    df_daily = ak.stock_hk_hist(symbol=hk_symbol, period="daily", adjust="qfq")
+                    df = call_ak(ak.stock_hk_hist_min_em, symbol=hk_symbol, period='5', adjust='qfq')
+                    df_daily = call_ak(ak.stock_hk_hist, symbol=hk_symbol, period="daily", adjust="qfq")
                 # 美股 字母
                 elif symbol.isalpha() or "." in symbol:
                     us_symbol = symbol if "." in symbol else f"105.{symbol}"
-                    df = ak.stock_us_hist_min_em(symbol=us_symbol)
-                    df_daily = ak.stock_us_hist(symbol=us_symbol)
+                    df = call_ak(ak.stock_us_hist_min_em, symbol=us_symbol)
+                    df_daily = call_ak(ak.stock_us_hist, symbol=us_symbol)
                 
                 if df is not None and not df.empty and df_daily is not None and not df_daily.empty:
                     df['时间'] = pd.to_datetime(df['时间'])
@@ -859,6 +971,11 @@ def post_intraday_valuation(payload: dict):
     return {"ok": True}
 
 
+@app.get("/best_source")
+def get_recommended_source(code: str):
+    return {"code": code, "bestSource": get_best_source(code)}
+
+
 @app.get("/proxy/sina")
 def proxy_sina(list: str):
     """
@@ -971,6 +1088,9 @@ def background_tracker_loop():
                                 })
                         except Exception as e:
                             logger.error(f"Error tracking fund {code}: {e}")
+                        
+                        # 增加一个小延迟，避免过快连续调用导致 V8/akshare 压力过大
+                        time.sleep(1)
             
             # 每 5 分钟运行一次
             time.sleep(300) 

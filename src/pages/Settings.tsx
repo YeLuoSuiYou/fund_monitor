@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
 import { Switch } from "@/components/ui/Switch"
 import { useFundStore } from "@/stores/fundStore"
-import { defaultSettings, type ColorRule, type ThemeMode, type ViewMode, useSettingsStore } from "@/stores/settingsStore"
+import { defaultSettings, type ColorRule, type ThemeMode, type ViewMode, type ValuationMode, useSettingsStore } from "@/stores/settingsStore"
 import { quoteSourceOptions } from "@/utils/quote"
 
 type DraftSettings = {
@@ -22,6 +22,7 @@ type DraftSettings = {
   colorRule: ColorRule
   theme: ThemeMode
   viewMode: ViewMode
+  valuationMode: ValuationMode
 }
 
 export default function Settings() {
@@ -36,6 +37,7 @@ export default function Settings() {
   const colorRule = useSettingsStore((s) => s.colorRule)
   const theme = useSettingsStore((s) => s.theme)
   const viewMode = useSettingsStore((s) => s.viewMode) || "standard"
+  const valuationMode = useSettingsStore((s) => s.valuationMode) || "smart"
   const setSettings = useSettingsStore((s) => s.setSettings)
   const resetSettings = useSettingsStore((s) => s.resetSettings)
   const clearData = useFundStore((s) => s.clearData)
@@ -52,8 +54,9 @@ export default function Settings() {
       colorRule,
       theme,
       viewMode,
+      valuationMode,
     }),
-    [fundCodes, refreshIntervalSec, autoRefreshEnabled, quoteSourceId, customQuoteUrlTemplate, holdingsApiBaseUrl, decimals, colorRule, theme, viewMode]
+    [fundCodes, refreshIntervalSec, autoRefreshEnabled, quoteSourceId, customQuoteUrlTemplate, holdingsApiBaseUrl, decimals, colorRule, theme, viewMode, valuationMode]
   )
   const [draft, setDraft] = useState<DraftSettings>(() => ({ ...currentDraft }))
   const [newCodesText, setNewCodesText] = useState("")
@@ -116,6 +119,7 @@ export default function Settings() {
       colorRule: draft.colorRule,
       theme: draft.theme,
       viewMode: draft.viewMode,
+      valuationMode: draft.valuationMode,
     })
     setSavedToast(true)
     window.setTimeout(() => setSavedToast(false), 1500)
@@ -337,6 +341,20 @@ export default function Settings() {
                   >
                     <option value="red_up_green_down">红涨绿跌</option>
                     <option value="green_up_red_down">绿涨红跌</option>
+                  </Select>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-zinc-500 dark:text-zinc-400">估值源策略</label>
+                <div className="mt-2">
+                  <Select
+                    value={draft.valuationMode}
+                    onChange={(e) => setDraft((d) => ({ ...d, valuationMode: e.target.value as ValuationMode }))}
+                  >
+                    <option value="smart">智能选择 (根据昨日准确度)</option>
+                    <option value="official">官方估值 (天天基金)</option>
+                    <option value="holdings">持仓推算 (重仓股实时行情)</option>
                   </Select>
                 </div>
               </div>

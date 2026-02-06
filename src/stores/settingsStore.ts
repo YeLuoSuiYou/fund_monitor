@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware"
 export type ThemeMode = "dark" | "light"
 export type ColorRule = "red_up_green_down" | "green_up_red_down"
 export type ViewMode = "standard" | "compact"
+export type ValuationMode = "official" | "holdings" | "smart"
 
 export function normalizeFundCodes(input: unknown): string[] {
   const raw = Array.isArray(input) ? input : []
@@ -47,6 +48,9 @@ function sanitizeSettings(input: Partial<SettingsState>): Partial<SettingsState>
   if ("viewMode" in input && (input.viewMode === "standard" || input.viewMode === "compact")) {
     out.viewMode = input.viewMode
   }
+  if ("valuationMode" in input && (input.valuationMode === "official" || input.valuationMode === "holdings" || input.valuationMode === "smart")) {
+    out.valuationMode = input.valuationMode
+  }
   return out
 }
 
@@ -62,6 +66,7 @@ export type SettingsState = {
   colorRule: ColorRule
   theme: ThemeMode
   viewMode: ViewMode
+  valuationMode: ValuationMode
 }
 
 export type SettingsActions = {
@@ -85,6 +90,7 @@ export const defaultSettings: SettingsState = {
   colorRule: "red_up_green_down",
   theme: "dark",
   viewMode: "standard",
+  valuationMode: "smart",
 }
 
 export const useSettingsStore = create<SettingsStore>()(
@@ -175,6 +181,7 @@ export const useSettingsStore = create<SettingsStore>()(
         colorRule: s.colorRule,
         theme: s.theme,
         viewMode: s.viewMode,
+        valuationMode: s.valuationMode,
       }),
     },
   ),

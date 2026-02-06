@@ -33,7 +33,12 @@ export type FundState = {
 export type FundActions = {
   refreshAll: (
     codes: string[],
-    options?: { quoteSourceId?: QuoteSourceId; customQuoteTemplate?: string | null; holdingsApiBaseUrl?: string },
+    options?: { 
+      quoteSourceId?: QuoteSourceId; 
+      customQuoteTemplate?: string | null; 
+      holdingsApiBaseUrl?: string;
+      valuationMode?: import("./settingsStore").ValuationMode;
+    },
   ) => Promise<void>
   clearData: () => void
 }
@@ -111,7 +116,9 @@ export const useFundStore = create<FundStore>((set, get) => ({
     const quoteSourceId = options.quoteSourceId ?? "sina"
     const customQuoteTemplate = options.customQuoteTemplate ?? null
     const holdingsApiBaseUrl = options.holdingsApiBaseUrl ?? "http://localhost:8001"
-    console.log(`[FundStore] Refreshing with holdings API: ${holdingsApiBaseUrl}`)
+    const valuationMode = options.valuationMode ?? "smart"
+
+    console.log(`[FundStore] Refreshing with holdings API: ${holdingsApiBaseUrl}, mode: ${valuationMode}`)
     const list = normalizeCodes(codes)
     if (list.length === 0) {
       set(() => ({ status: "idle", errorMessage: null, summary: emptySummary, lastRefreshStartedAt: null }))
@@ -245,6 +252,22 @@ export const useFundStore = create<FundStore>((set, get) => ({
       }
     })
 
+    // 如果是智能模式，获取推荐的估值源
+    const bestSources: Record<string, string> = {}
+    if (valuationMode === "smart") {
+      const bestSourceResults = await Promise.allSettled(
+        list.map((code) =>
+          fetch(`${holdingsApiBaseUrl.replace(/\/+$/, "")}/best_source?code=${code}`).then((r) => r.json()),
+        ),
+      )
+      bestSourceResults.forEach((result, idx) => {
+        const code = list[idx]
+        if (result.status === "fulfilled") {
+          bestSources[code] = result.value.bestSource
+        }
+      })
+    }
+
     const fallbackCodes = list.filter((code) => {
       const official = officialMap[code]
       return !official || !official.gztime || !official.gztime.startsWith(todayStr)
@@ -308,9 +331,25 @@ export const useFundStore = create<FundStore>((set, get) => ({
       const config = parsedHoldings[code]
       const err = fundErrors[code]
       const official = officialMap[code]
-      const hasOfficial = official && official.gztime && official.gztime.startsWith(todayStr)
+      const isOfficialAvailable = official && official.gztime && official.gztime.startsWith(todayStr)
+      
+      let useOfficial = false
+      if (valuationMode === "official") {
+        useOfficial = isOfficialAvailable
+      } else if (valuationMode === "holdings") {
+        useOfficial = false
+      } else {
+        // smart 模式
+        const best = bestSources[code] || "eastmoney"
+        if (best === "eastmoney") {
+          useOfficial = isOfficialAvailable
+        } else {
+          useOfficial = false
+        }
+      }
+
       const previous = baseFunds[code]?.latest ?? baseFunds[code]?.previous ?? null
-      if (hasOfficial) {
+      if (useOfficial && official) {
         const estimate: FundEstimate = {
           code,
           name: official.name ?? config?.fundName ?? code,
