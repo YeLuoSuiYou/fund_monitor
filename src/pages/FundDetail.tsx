@@ -112,19 +112,28 @@ export default function FundDetail() {
     
     // 如果没有 5min 序列数据，但有今日实时涨跌幅，构造一个点以防止图表空白
     if (period === "INTRADAY") {
-      let points = [...intraday]
+      let points = [...intraday].filter((p) => {
+        if (!latest?.valuationSource) return true
+        return !p.source || p.source === latest.valuationSource
+      })
       
-      if (points.length === 0 && latest?.gszzl !== null && latest?.gztime?.includes(todayStr)) {
+      if (latest?.gszzl != null && latest?.gztime?.includes(todayStr)) {
         // 提取 gztime 中的 HH:mm
         const timeMatch = latest.gztime.match(/\d{2}:\d{2}/)
         const timeStr = timeMatch ? timeMatch[0] : "15:00"
-        points.push({ time: timeStr, value: latest.gszzl! })
+        const existed = points.some((p) => p.time === timeStr)
+        if (!existed) points.push({ time: timeStr, value: latest.gszzl, source: latest.valuationSource })
+        else {
+          points = points.map((p) =>
+            p.time === timeStr ? { ...p, value: latest.gszzl!, source: latest.valuationSource } : p,
+          )
+        }
       }
 
-      if (latest?.actualZzl !== null && latest?.actualDate === todayStr) {
+      if (latest?.actualZzl != null && latest?.actualDate === todayStr) {
         const hasActual = points.some(p => p.time.includes("(实)"))
         if (!hasActual) {
-          points.push({ time: "15:00(实)", value: latest.actualZzl! })
+          points.push({ time: "15:00(实)", value: latest.actualZzl, source: "actual" })
         }
       }
       
@@ -194,6 +203,8 @@ export default function FundDetail() {
   const COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#f97316"]
 
   const colorRule = useSettingsStore((s) => s.colorRule)
+  const gszzlTone =
+    latest?.gszzl == null ? "flat" : latest.gszzl > 0 ? "up" : latest.gszzl < 0 ? "down" : "flat"
   const getDeltaClass = (tone: "up" | "down" | "flat", rule: string) => {
     if (tone === "flat") return "text-zinc-500"
     if (rule === "red_up_green_down") {
@@ -360,8 +371,8 @@ export default function FundDetail() {
                 </div>
                 <div>
                   <div className="text-xs text-zinc-500">估值涨跌幅</div>
-                  <div className={`text-xl font-bold ${latest?.gszzl && latest.gszzl > 0 ? "text-rose-500" : "text-emerald-500"}`}>
-                    {latest?.gszzl ? `${latest.gszzl.toFixed(2)}%` : "--"}
+                  <div className={`text-xl font-bold ${getDeltaClass(gszzlTone, colorRule)}`}>
+                    {latest?.gszzl != null ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : "--"}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs text-zinc-500">

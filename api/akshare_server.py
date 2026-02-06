@@ -776,7 +776,7 @@ def backfill_intraday_history(code: str):
             if matched_weight > 0:
                 final_return = (matched_contribution / matched_weight) * equity_ratio
                 gszzl = round(final_return * 100, 4)
-                reconstructed_points.append({"time": t, "value": gszzl})
+                reconstructed_points.append({"time": t, "value": gszzl, "source": "holdings"})
         
         if reconstructed_points:
             with data_lock:
@@ -816,7 +816,13 @@ def get_intraday_valuation(code: str):
             logger.info(f"Today's intraday is empty for {code}, returning latest available from {latest_date_key}")
             points = fund_data[latest_date_key]
             
-    return points
+    normalized = []
+    for p in points:
+        if isinstance(p, dict) and "source" not in p:
+            normalized.append({**p, "source": "holdings"})
+        else:
+            normalized.append(p)
+    return normalized
 
 
 @app.post("/intraday_valuation")
@@ -824,6 +830,7 @@ def post_intraday_valuation(payload: dict):
     code = str(payload.get("code")).strip()
     time_str = payload.get("time") # HH:mm
     value = payload.get("value")
+    source = payload.get("source")
     
     if not code or not time_str or value is None:
         raise HTTPException(status_code=400, detail="missing fields")
@@ -839,8 +846,13 @@ def post_intraday_valuation(payload: dict):
         existing = next((p for p in history if p["time"] == time_str), None)
         if existing:
             existing["value"] = value
+            if source:
+                existing["source"] = source
         else:
-            history.append({"time": time_str, "value": value})
+            point = {"time": time_str, "value": value}
+            if source:
+                point["source"] = source
+            history.append(point)
             history.sort(key=lambda x: x["time"])
     
     save_intraday_history()

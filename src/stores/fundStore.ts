@@ -320,7 +320,7 @@ export const useFundStore = create<FundStore>((set, get) => ({
           coverage: 1,
           cashRatio: config?.cashRatio ?? 0,
           holdingsDate: config?.holdingsDate,
-          baseNav: config?.baseNav ?? official.dwjz ?? null,
+          baseNav: official.dwjz ?? config?.baseNav ?? null,
           navMetrics: config?.navMetrics ?? null,
           stale: config?.stale,
           cachedAt: config?.cachedAt,
@@ -338,6 +338,15 @@ export const useFundStore = create<FundStore>((set, get) => ({
           lastRefreshStartedAt: startedAt,
           latest: estimate,
           previous,
+        }
+        if (estimate.gszzl !== null) {
+          const now = new Date()
+          const timeStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`
+          const key = `${code}:${estimate.valuationSource}`
+          if (intradaySentCache[key] !== timeStr) {
+            intradaySentCache[key] = timeStr
+            recordIntradayValuation(holdingsApiBaseUrl, code, timeStr, estimate.gszzl, estimate.valuationSource)
+          }
         }
         continue
       }
@@ -398,9 +407,10 @@ export const useFundStore = create<FundStore>((set, get) => ({
       if (estimate.gszzl !== null) {
         const now = new Date()
         const timeStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`
-        if (intradaySentCache[code] !== timeStr) {
-          intradaySentCache[code] = timeStr
-          recordIntradayValuation(holdingsApiBaseUrl, code, timeStr, estimate.gszzl)
+        const key = `${code}:${estimate.valuationSource}`
+        if (intradaySentCache[key] !== timeStr) {
+          intradaySentCache[key] = timeStr
+          recordIntradayValuation(holdingsApiBaseUrl, code, timeStr, estimate.gszzl, estimate.valuationSource)
         }
       }
     }

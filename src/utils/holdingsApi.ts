@@ -32,6 +32,7 @@ export type FundHistoryResponse = {
 export type IntradayPoint = {
   time: string
   value: number
+  source?: string
 }
 
 export async function fetchFundHoldings(baseUrl: string, code: string) {
@@ -78,12 +79,18 @@ export async function fetchIntradayValuation(baseUrl: string, code: string) {
   return (await res.json()) as IntradayPoint[]
 }
 
-export async function recordIntradayValuation(baseUrl: string, code: string, time: string, value: number) {
+export async function recordIntradayValuation(
+  baseUrl: string,
+  code: string,
+  time: string,
+  value: number,
+  source?: string,
+) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/intraday_valuation`
   await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code, time, value }),
+    body: JSON.stringify({ code, time, value, source }),
   }).catch((err) => console.error("Record intraday failed:", err))
 }
