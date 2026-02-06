@@ -55,4 +55,3 @@ export default tseslint.config({
   },
 })
 ```
-# fund_monitor
