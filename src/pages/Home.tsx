@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { Link, useNavigate } from "react-router-dom"
-import { LayoutGrid, List, RefreshCw, Settings as SettingsIcon } from "lucide-react"
+import { LayoutGrid, List, RefreshCw, Settings as SettingsIcon, BarChart2 } from "lucide-react"
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/Card"
@@ -292,6 +292,12 @@ export default function Home() {
               {isCompact ? <LayoutGrid className="h-4 w-4" /> : <List className="h-4 w-4" />}
               {isCompact ? "标准模式" : "紧凑模式"}
             </Button>
+            <Link to="/backtest">
+              <Button variant="secondary" size="sm">
+                <BarChart2 className="h-4 w-4" />
+                回测报告
+              </Button>
+            </Link>
             <Link to="/settings">
               <Button variant="secondary" size="sm">
                 <SettingsIcon className="h-4 w-4" />

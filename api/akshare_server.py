@@ -34,6 +34,7 @@ CACHE_TTL_SEC = 6 * 60 * 60
 CACHE_FILE = "cache.json"
 USER_SETTINGS_FILE = "user_settings.json"
 INTRADAY_HISTORY_FILE = "intraday_history.json"
+BACKTEST_CACHE_FILE = "backtest_cache.json"
 FAIL_BASE_SEC = 10
 FAIL_MAX_SEC = 300
 NAV_REFRESH_AFTER_HOUR = 18
@@ -100,6 +101,7 @@ def load_persistent_cache():
 # 准确度记录
 accuracy_history_data = {} # { code: { date: { "eastmoney": error, "holdings": error } } }
 ACCURACY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "accuracy_history.json")
+backtest_cache_data = {} # { date: { code: { mae, hit_rate_02, hit_rate_05, max_err } } }
 
 def load_accuracy_history():
     global accuracy_history_data
@@ -118,7 +120,25 @@ def save_accuracy_history():
     except Exception as e:
         logger.error(f"Failed to save accuracy history: {e}")
 
+def load_backtest_cache():
+    global backtest_cache_data
+    if os.path.exists(BACKTEST_CACHE_FILE):
+        try:
+            with open(BACKTEST_CACHE_FILE, "r") as f:
+                backtest_cache_data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load backtest cache: {e}")
+            backtest_cache_data = {}
+
+def save_backtest_cache():
+    try:
+        with open(BACKTEST_CACHE_FILE, "w") as f:
+            json.dump(backtest_cache_data, f)
+    except Exception as e:
+        logger.error(f"Failed to save backtest cache: {e}")
+
 load_accuracy_history()
+load_backtest_cache()
 
 def record_accuracy(code: str, target_date: str, actual_zzl: float):
     """
@@ -974,6 +994,138 @@ def post_intraday_valuation(payload: dict):
 @app.get("/best_source")
 def get_recommended_source(code: str):
     return {"code": code, "bestSource": get_best_source(code)}
+
+
+def run_single_backtest(code: str, days=30):
+    """
+    对单个基金运行过去 30 天的回测
+    """
+    try:
+        # 1. 获取持仓和基本信息
+        holdings_data = parse_latest_holdings(code)
+        if not holdings_data: return None
+        
+        cash_ratio, _ = parse_cash_ratio(code)
+        cash_ratio = (cash_ratio or 0) / 100
+        equity_ratio = 1 - cash_ratio
+        
+        # 2. 获取基金历史净值
+        df_nav = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
+        if df_nav is None or df_nav.empty: return None
+        
+        col_date = pick_col(df_nav.columns, ["净值日期", "日期"])
+        col_nav = pick_col(df_nav.columns, ["单位净值", "净值"])
+        col_zzl = pick_col(df_nav.columns, ["日增长率", "增长率"])
+        
+        df_nav[col_date] = pd.to_datetime(df_nav[col_date])
+        df_nav = df_nav.sort_values(col_date).tail(days)
+        
+        if df_nav.empty: return None
+        
+        # 3. 获取重仓股历史行情
+        start_date = df_nav[col_date].min().strftime("%Y%m%d")
+        end_date = df_nav[col_date].max().strftime("%Y%m%d")
+        
+        stock_histories = {}
+        for h in holdings_data["holdings"]:
+            symbol = h["symbol"]
+            df_s = None
+            if len(symbol) == 6 and symbol.isdigit():
+                df_s = call_ak(ak.stock_zh_a_hist, symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            elif 1 <= len(symbol) <= 5 and symbol.isdigit():
+                df_s = call_ak(ak.stock_hk_hist, symbol=symbol.zfill(5), period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            else:
+                df_s = call_ak(ak.stock_us_hist, symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            
+            if df_s is not None and not df_s.empty:
+                df_s["日期"] = pd.to_datetime(df_s["日期"])
+                df_s = df_s.sort_values("日期")
+                df_s["ret"] = df_s["收盘"].pct_change()
+                stock_histories[symbol] = df_s
+        
+        # 4. 计算每日误差
+        errors = []
+        for _, row in df_nav.iterrows():
+            d = row[col_date]
+            actual = row[col_zzl]
+            if isinstance(actual, str):
+                try: actual = float(actual.replace("%", ""))
+                except: continue
+            
+            matched_w = 0
+            contrib = 0
+            for h in holdings_data["holdings"]:
+                s = h["symbol"]
+                w = h["weight"]
+                if s in stock_histories:
+                    s_df = stock_histories[s]
+                    s_row = s_df[s_df["日期"] == d]
+                    if not s_row.empty:
+                        s_ret = s_row["ret"].iloc[0]
+                        if pd.notna(s_ret):
+                            matched_w += w
+                            contrib += w * s_ret
+            
+            if matched_w > 0:
+                est = (contrib / matched_w) * equity_ratio * 100
+                errors.append(abs(est - actual))
+        
+        if not errors: return None
+        
+        errors_arr = np.array(errors)
+        return {
+            "code": code,
+            "name": get_fund_name(code),
+            "mae": float(np.mean(errors_arr)),
+            "hit_rate_02": float(np.mean(errors_arr <= 0.2) * 100),
+            "hit_rate_05": float(np.mean(errors_arr <= 0.5) * 100),
+            "max_err": float(np.max(errors_arr)),
+            "samples": len(errors)
+        }
+    except Exception as e:
+        logger.error(f"Backtest failed for {code}: {e}")
+        return None
+
+
+@app.get("/backtest_report")
+def get_backtest_report(force_refresh: bool = False):
+    today = date.today().isoformat()
+    with data_lock:
+        codes = list(user_settings_data.get("fundCodes", []))
+    
+    if not codes:
+        return {"date": today, "results": []}
+    
+    # 检查缓存
+    if not force_refresh and today in backtest_cache_data:
+        # 过滤掉不在当前列表中的基金
+        cached_results = [backtest_cache_data[today][c] for c in codes if c in backtest_cache_data[today]]
+        if len(cached_results) == len(codes):
+            logger.info("Returning cached backtest report")
+            return {"date": today, "results": cached_results}
+    
+    logger.info(f"Running full backtest for {len(codes)} funds...")
+    results = []
+    for code in codes:
+        res = run_single_backtest(code)
+        if res:
+            results.append(res)
+    
+    # 更新缓存
+    if today not in backtest_cache_data:
+        backtest_cache_data[today] = {}
+    
+    for res in results:
+        backtest_cache_data[today][res["code"]] = res
+    
+    # 清理旧缓存（保留 7 天）
+    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    for d in list(backtest_cache_data.keys()):
+        if d < cutoff:
+            del backtest_cache_data[d]
+            
+    save_backtest_cache()
+    return {"date": today, "results": results}
 
 
 @app.get("/proxy/sina")
