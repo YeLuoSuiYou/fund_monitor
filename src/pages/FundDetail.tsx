@@ -16,6 +16,7 @@ import {
   Cell,
 } from "recharts"
 import { Button } from "@/components/ui/Button"
+import { Badge } from "@/components/ui/Badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card"
 import { useFundStore } from "@/stores/fundStore"
 import { useSettingsStore } from "@/stores/settingsStore"
@@ -27,7 +28,7 @@ import {
   type IntradayPoint,
 } from "@/utils/holdingsApi"
 import { fetchStockQuotes, type QuoteSourceId, type StockQuote } from "@/utils/quote"
-import { formatDate } from "@/utils/time"
+import { formatDate, isMiddayBreak } from "@/utils/time"
 import { cn } from "@/lib/utils"
 
 type Period = "INTRADAY" | "1M" | "3M" | "1Y" | "ALL"
@@ -114,6 +115,13 @@ export default function FundDetail() {
     if (period === "INTRADAY") {
       const allPoints = [...intraday]
       let points = allPoints.filter((p) => {
+        // 过滤掉非交易时段的点位（如午间休市时的异常跳动）
+        const [hh, mm] = p.time.split(":").map(Number)
+        const totalMin = hh * 60 + mm
+        const isMarketTime = (totalMin >= 9 * 60 + 15 && totalMin <= 11 * 60 + 30) || 
+                            (totalMin >= 13 * 60 && totalMin <= 15 * 5)
+        if (!isMarketTime) return false
+
         if (!latest?.valuationSource) return true
         return !p.source || p.source === latest.valuationSource
       })
@@ -373,8 +381,11 @@ export default function FundDetail() {
 
           <div className="space-y-6">
             <Card>
-              <CardHeader>
+              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="text-base">当前状态</CardTitle>
+                {isMiddayBreak() && (
+                   <Badge tone="info" className="px-1.5 py-0 text-[10px]">午间休市</Badge>
+                 )}
               </CardHeader>
               <CardContent className="space-y-4">
                 <div>
@@ -383,17 +394,19 @@ export default function FundDetail() {
                 </div>
                 <div>
                   <div className="text-xs text-zinc-500">盘中估值</div>
-                  <div className="text-2xl font-bold">{latest?.gsz?.toFixed(4) || "--"}</div>
+                  <div className="text-2xl font-bold">
+                    {isMiddayBreak() ? "--" : (latest?.gsz?.toFixed(4) || "--")}
+                  </div>
                 </div>
                 <div>
                   <div className="text-xs text-zinc-500">估值涨跌幅</div>
-                  <div className={`text-xl font-bold ${getDeltaClass(gszzlTone, colorRule)}`}>
-                    {latest?.gszzl != null ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : "--"}
+                  <div className={`text-xl font-bold ${isMiddayBreak() ? "text-zinc-500" : getDeltaClass(gszzlTone, colorRule)}`}>
+                    {isMiddayBreak() ? "休市中" : (latest?.gszzl != null ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : "--")}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs text-zinc-500">
-                  <div>估值来源：{valuationSourceText}</div>
-                  <div>行情时间：{quoteTimeText}</div>
+                  <div>估值来源：{isMiddayBreak() ? "--" : valuationSourceText}</div>
+                  <div>行情时间：{isMiddayBreak() ? "--" : quoteTimeText}</div>
                 </div>
               </CardContent>
             </Card>

@@ -1189,8 +1189,9 @@ def background_tracker_loop():
             is_market_time = False
             if is_weekday:
                 time_now = now.time()
-                if (dt_time(9, 25) <= time_now <= dt_time(11, 35)) or \
-                   (dt_time(12, 55) <= time_now <= dt_time(15, 5)):
+                # A股交易时间: 9:15-11:30 (含竞价), 13:00-15:00
+                if (dt_time(9, 15) <= time_now <= dt_time(11, 30)) or \
+                   (dt_time(13, 0) <= time_now <= dt_time(15, 0)):
                     is_market_time = True
             
             if is_market_time:

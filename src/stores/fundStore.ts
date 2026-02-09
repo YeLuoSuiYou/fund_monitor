@@ -3,6 +3,7 @@ import { fetchFundGzEstimate, isValuationError, type FundGzEstimate } from "@/ut
 import { buildFundEstimate, type FundEstimate } from "@/utils/estimate"
 import { fetchFundHoldings, recordIntradayValuation } from "@/utils/holdingsApi"
 import { fetchStockQuotes, normalizeQuoteSymbol, type QuoteSourceId, type StockQuote } from "@/utils/quote"
+import { isTradingTime, isMiddayBreak } from "@/utils/time"
 
 export type LoadStatus = "idle" | "loading" | "success" | "error"
 
@@ -378,7 +379,8 @@ export const useFundStore = create<FundStore>((set, get) => ({
           latest: estimate,
           previous,
         }
-        if (estimate.gszzl !== null) {
+        // 仅在交易时间内上报日内点位，避免午间休息时的异常点
+        if (estimate.gszzl !== null && isTradingTime()) {
           const now = new Date()
           const timeStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`
           const key = `${code}:${estimate.valuationSource}`
