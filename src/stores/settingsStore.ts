@@ -78,6 +78,32 @@ export type SettingsActions = {
 export type SettingsStore = SettingsState & SettingsActions
 
 const defaultHoldingsApiBaseUrl = import.meta.env.VITE_HOLDINGS_API_BASE_URL ?? "http://localhost:8001"
+const SETTINGS_REQUEST_TIMEOUT_MS = 5000
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = SETTINGS_REQUEST_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+async function syncSettingsToBackend(baseUrl: string, payload: SettingsState, logPrefix: string) {
+  try {
+    const res = await fetchWithTimeout(`${baseUrl.replace(/\/+$/, "")}/user_settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      console.error(`${logPrefix} HTTP ${res.status}`)
+    }
+  } catch (err) {
+    console.error(`${logPrefix}`, err)
+  }
+}
 
 export const defaultSettings: SettingsState = {
   fundCodes: [],
@@ -103,26 +129,18 @@ export const useSettingsStore = create<SettingsStore>()(
         if (syncToBackend) {
           const next = get()
           const baseUrl = next.holdingsApiBaseUrl || defaultHoldingsApiBaseUrl
-          fetch(`${baseUrl.replace(/\/+$/, "")}/user_settings`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(next),
-          }).catch((err) => console.error("[SettingsStore] Sync to backend failed:", err))
+          void syncSettingsToBackend(baseUrl, next, "[SettingsStore] Sync to backend failed:")
         }
       },
       resetSettings: () => {
         const newState = { ...defaultSettings }
         set(newState)
-        fetch(`${newState.holdingsApiBaseUrl.replace(/\/+$/, "")}/user_settings`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(newState),
-        }).catch((err) => console.error("[SettingsStore] Reset sync failed:", err))
+        void syncSettingsToBackend(newState.holdingsApiBaseUrl, newState, "[SettingsStore] Reset sync failed:")
       },
       loadFromBackend: async () => {
         try {
           const baseUrl = get().holdingsApiBaseUrl || defaultHoldingsApiBaseUrl
-          const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/user_settings`)
+          const res = await fetchWithTimeout(`${baseUrl.replace(/\/+$/, "")}/user_settings`)
           if (res.ok) {
             const data = await res.json()
             if (data && Object.keys(data).length > 0) {
@@ -133,6 +151,8 @@ export const useSettingsStore = create<SettingsStore>()(
                 get().setSettings(sanitized, false)
               }
             }
+          } else {
+            console.error(`[SettingsStore] Load from backend failed: HTTP ${res.status}`)
           }
         } catch (err) {
           console.error("[SettingsStore] Load from backend failed:", err)

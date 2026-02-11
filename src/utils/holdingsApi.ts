@@ -35,10 +35,27 @@ export type IntradayPoint = {
   source?: string
 }
 
+const DEFAULT_TIMEOUT_MS = 7000
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController()
+  const id = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw createValuationError("timeout", "请求超时")
+    }
+    throw createValuationError("network", error instanceof Error ? error.message : "网络请求失败")
+  } finally {
+    window.clearTimeout(id)
+  }
+}
+
 export async function fetchFundHoldings(baseUrl: string, code: string) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/holdings?code=${encodeURIComponent(code)}`
-  const res = await fetch(url)
+  const res = await fetchWithTimeout(url)
   if (!res.ok) {
     throw createValuationError("network", `持仓请求失败 HTTP ${res.status}`)
   }
@@ -52,7 +69,7 @@ export async function fetchFundHoldings(baseUrl: string, code: string) {
 export async function fetchFundHistory(baseUrl: string, code: string) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/fund_history?code=${encodeURIComponent(code)}`
-  const res = await fetch(url)
+  const res = await fetchWithTimeout(url)
   if (!res.ok) {
     throw createValuationError("network", "历史净值请求失败")
   }
@@ -63,9 +80,9 @@ export async function fetchFundHistory(baseUrl: string, code: string) {
 export async function fetchSinaProxy(baseUrl: string, list: string) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/proxy/sina?list=${encodeURIComponent(list)}`
-  const res = await fetch(url)
+  const res = await fetchWithTimeout(url)
   if (!res.ok) {
-    throw new Error("Sina proxy failed")
+    throw createValuationError("network", `Sina proxy failed HTTP ${res.status}`)
   }
   const data = await res.json()
   return data.data as string
@@ -74,7 +91,7 @@ export async function fetchSinaProxy(baseUrl: string, list: string) {
 export async function fetchIntradayValuation(baseUrl: string, code: string) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/intraday_valuation?code=${encodeURIComponent(code)}`
-  const res = await fetch(url)
+  const res = await fetchWithTimeout(url)
   if (!res.ok) return []
   return (await res.json()) as IntradayPoint[]
 }
@@ -88,9 +105,20 @@ export async function recordIntradayValuation(
 ) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/intraday_valuation`
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code, time, value, source }),
-  }).catch((err) => console.error("Record intraday failed:", err))
+  try {
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, time, value, source }),
+      },
+      5000,
+    )
+    if (!res.ok) {
+      console.warn("Record intraday failed with status:", res.status)
+    }
+  } catch (err) {
+    console.error("Record intraday failed:", err)
+  }
 }

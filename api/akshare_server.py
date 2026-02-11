@@ -7,12 +7,13 @@ import re
 import threading
 import time
 from datetime import datetime, date, timedelta, time as dt_time
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 
 import akshare as ak
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ValidationError
 
 # 配置日志
 logging.basicConfig(
@@ -21,10 +22,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def resolve_cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+    if raw == "*":
+        return ["*"]
+    origins = [v.strip() for v in raw.split(",") if v.strip()]
+    return origins or ["*"]
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=resolve_cors_origins(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,6 +55,30 @@ user_settings_data = {} # 存储基金列表等用户配置
 intraday_history_data = {} # 存储日内估值点 { code: { date: [ { time, value } ] } }
 data_lock = threading.Lock()
 ak_lock = threading.Lock() # 专门用于保护 akshare 调用，防止 mini_racer 崩溃
+
+class UserSettingsPayload(BaseModel):
+    fundCodes: List[str] = Field(default_factory=list)
+    refreshIntervalSec: int = Field(default=30, ge=5, le=3600)
+    autoRefreshEnabled: bool = True
+    quoteSourceId: Literal["sina", "custom"] = "sina"
+    customQuoteUrlTemplate: str = ""
+    holdingsApiBaseUrl: str = ""
+    decimals: int = Field(default=3, ge=0, le=6)
+    colorRule: Literal["red_up_green_down", "green_up_red_down"] = "red_up_green_down"
+    theme: Literal["dark", "light"] = "dark"
+    viewMode: Literal["standard", "compact"] = "standard"
+    valuationMode: Literal["official", "holdings", "smart"] = "smart"
+
+def normalize_fund_codes(codes: List[str]) -> List[str]:
+    seen = set()
+    output = []
+    for code in codes:
+        c = str(code).strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        output.append(c)
+    return output
 
 def call_ak(func, *args, **kwargs):
     """
@@ -270,7 +302,8 @@ def get_fund_name(code: str):
                     fund_info_cache[code] = name
                     save_persistent_cache()
                     return name
-        except: pass
+        except Exception as e:
+            logger.debug(f"Primary fund name source failed for {code}: {e}")
 
         try:
             # 备选：天天基金列表
@@ -284,7 +317,8 @@ def get_fund_name(code: str):
                     fund_info_cache[code] = name
                     save_persistent_cache()
                     return name
-        except: pass
+        except Exception as e:
+            logger.debug(f"Fallback fund name source failed for {code}: {e}")
         
     except Exception as e:
         logger.error(f"Error fetching fund name for {code}: {e}")
@@ -362,7 +396,9 @@ def parse_actual_data(code: str):
                                 actual_date = date_str
                                 actual_nav = float(val)
                                 break
-                            except: continue
+                            except Exception as e:
+                                logger.debug(f"Failed to parse actual nav date/value for {code}: {e}")
+                                continue
                     
                     actual_zzl = None
                     if col_zzl:
@@ -370,7 +406,8 @@ def parse_actual_data(code: str):
                             val = str(row[col_zzl]).replace("%", "").strip()
                             if val and val != "nan":
                                 actual_zzl = float(val)
-                        except: pass
+                        except Exception as e:
+                            logger.debug(f"Failed to parse actual daily zzl for {code}: {e}")
                     
                     if actual_date and actual_zzl is not None:
                         logger.info(f"Found actual data for {code} from daily list: {actual_date} {actual_zzl}%")
@@ -397,7 +434,8 @@ def parse_actual_data(code: str):
                     val = str(last_row[col_zzl]).replace("%", "").strip()
                     if val and val != "nan":
                         actual_zzl = float(val)
-                except: pass
+                except Exception as e:
+                    logger.debug(f"Failed to parse latest actual zzl for {code}: {e}")
             
             actual_date = None
             if col_date:
@@ -407,7 +445,8 @@ def parse_actual_data(code: str):
                 else:
                     try:
                         actual_date = pd.to_datetime(str(raw_date)).strftime("%Y-%m-%d")
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Failed to normalize actual date for {code}: {e}")
                         actual_date = str(raw_date).strip()[:10]
             
             actual_nav = None
@@ -416,7 +455,8 @@ def parse_actual_data(code: str):
                     val = str(last_row[col_nav]).strip()
                     if val and val != "nan":
                         actual_nav = float(val)
-                except: pass
+                except Exception as e:
+                    logger.debug(f"Failed to parse actual nav for {code}: {e}")
             
             return {
                 "actualZzl": actual_zzl,
@@ -644,7 +684,7 @@ def compute_nav_metrics(nav_df: pd.DataFrame, col_date: Optional[str], col_nav: 
         try:
             fv = float(v)
             return fv if np.isfinite(fv) else None
-        except:
+        except (TypeError, ValueError):
             return None
 
     return {
@@ -795,8 +835,15 @@ def get_user_settings():
 @app.post("/user_settings")
 def post_user_settings(settings: dict):
     global user_settings_data
+    try:
+        payload = UserSettingsPayload.model_validate(settings).model_dump()
+    except AttributeError:
+        payload = UserSettingsPayload.parse_obj(settings).dict()
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    payload["fundCodes"] = normalize_fund_codes(payload.get("fundCodes", []))
     with data_lock:
-        user_settings_data = settings
+        user_settings_data = payload
     save_user_settings()
     return {"ok": True}
 
@@ -1046,8 +1093,11 @@ def run_single_backtest(code: str, days=30):
             d = row[col_date]
             actual = row[col_zzl]
             if isinstance(actual, str):
-                try: actual = float(actual.replace("%", ""))
-                except: continue
+                try:
+                    actual = float(actual.replace("%", ""))
+                except Exception as e:
+                    logger.debug(f"Failed to parse backtest daily return for {code}: {e}")
+                    continue
             
             matched_w = 0
             contrib = 0
@@ -1169,7 +1219,9 @@ def fetch_sina_quotes_internal(symbols: List[str]) -> Dict[str, dict]:
                     prev_close = float(parts[2])
                     if prev_close > 0:
                         data[symbol] = {"price": price, "prev_close": prev_close}
-                except: continue
+                except Exception as e:
+                    logger.debug(f"Failed to parse internal quote for {symbol}: {e}")
+                    continue
         return data
     except Exception as e:
         logger.error(f"Error fetching internal quotes: {e}")
