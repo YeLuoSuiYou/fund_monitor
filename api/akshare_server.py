@@ -21,6 +21,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+FUND_CODE_RE = re.compile(r"^\d{6}$")
+INTRADAY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+SINA_SYMBOL_RE = re.compile(r"^(sh|sz|bj)\d{6}$", re.IGNORECASE)
 
 def resolve_cors_origins() -> List[str]:
     raw = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
@@ -79,6 +82,46 @@ def normalize_fund_codes(codes: List[str]) -> List[str]:
         seen.add(c)
         output.append(c)
     return output
+
+def validate_fund_code(code: str) -> str:
+    normalized = str(code).strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="code required")
+    if not FUND_CODE_RE.match(normalized):
+        raise HTTPException(status_code=422, detail="invalid code format")
+    return normalized
+
+def validate_intraday_time(time_str: str) -> str:
+    normalized = str(time_str).strip()
+    if not INTRADAY_TIME_RE.match(normalized):
+        raise HTTPException(status_code=422, detail="invalid time format, expected HH:mm")
+    return normalized
+
+def normalize_intraday_source(source: Optional[str]) -> Optional[str]:
+    if source is None:
+        return None
+    normalized = str(source).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in ("eastmoney", "holdings"):
+        raise HTTPException(status_code=422, detail="invalid source")
+    return normalized
+
+def sanitize_sina_list(raw_list: str) -> str:
+    text = str(raw_list).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="list required")
+    parts = [s.strip().lower() for s in text.split(",") if s.strip()]
+    if not parts:
+        raise HTTPException(status_code=422, detail="empty list")
+    if len(parts) > 200:
+        raise HTTPException(status_code=422, detail="too many symbols")
+    valid_symbols: List[str] = []
+    for symbol in parts:
+        if not SINA_SYMBOL_RE.match(symbol):
+            raise HTTPException(status_code=422, detail=f"invalid symbol: {symbol}")
+        valid_symbols.append(symbol)
+    return ",".join(valid_symbols)
 
 def call_ak(func, *args, **kwargs):
     """
@@ -731,9 +774,7 @@ def refresh_nav_snapshot(code: str, data: dict, now: float) -> dict:
 @app.get("/holdings")
 def get_holdings(code: str):
     now = time.time()
-    code = str(code).strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="code required")
+    code = validate_fund_code(code)
     cached = cache_store.get(code)
     if cached and cached["expires_at"] > now:
         data = cached["data"]
@@ -801,6 +842,7 @@ def get_holdings(code: str):
 
 @app.get("/fund_history")
 def get_fund_history(code: str):
+    code = validate_fund_code(code)
     try:
         logger.info(f"Fetching history for {code}")
         df = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
@@ -968,7 +1010,7 @@ def backfill_intraday_history(code: str):
 
 @app.get("/intraday_valuation")
 def get_intraday_valuation(code: str):
-    code = str(code).strip()
+    code = validate_fund_code(code)
     today = date.today().isoformat()
     with data_lock:
         fund_data = json.loads(json.dumps(intraday_history_data.get(code, {})))
@@ -1003,13 +1045,20 @@ def get_intraday_valuation(code: str):
 
 @app.post("/intraday_valuation")
 def post_intraday_valuation(payload: dict):
-    code = str(payload.get("code")).strip()
-    time_str = payload.get("time") # HH:mm
+    raw_code = payload.get("code")
+    raw_time = payload.get("time") # HH:mm
     value = payload.get("value")
-    source = payload.get("source")
-    
-    if not code or not time_str or value is None:
+    raw_source = payload.get("source")
+
+    if raw_code is None or raw_time is None or value is None:
         raise HTTPException(status_code=400, detail="missing fields")
+    code = validate_fund_code(raw_code)
+    time_str = validate_intraday_time(raw_time)
+    source = normalize_intraday_source(raw_source)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="invalid value")
     
     today = date.today().isoformat()
     with data_lock:
@@ -1037,6 +1086,7 @@ def post_intraday_valuation(payload: dict):
 
 @app.get("/best_source")
 def get_recommended_source(code: str):
+    code = validate_fund_code(code)
     return {"code": code, "bestSource": get_best_source(code)}
 
 
@@ -1180,10 +1230,8 @@ def proxy_sina(list: str):
     """
     代理新浪行情接口，解决前端 Referer 限制和 CORS 问题
     """
-    if not list:
-        raise HTTPException(status_code=400, detail="list required")
-    
-    url = f"https://hq.sinajs.cn/list={list}"
+    safe_list = sanitize_sina_list(list)
+    url = f"https://hq.sinajs.cn/list={safe_list}"
     headers = {
         "Referer": "https://finance.sina.com.cn/",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
