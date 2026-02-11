@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CACHE_TTL_SEC = 6 * 60 * 60
+CACHE_TTL_SEC = 7 * 24 * 60 * 60 # 延长至 7 天
 CACHE_FILE = "cache.json"
 USER_SETTINGS_FILE = "user_settings.json"
 INTRADAY_HISTORY_FILE = "intraday_history.json"
@@ -65,11 +65,8 @@ def load_persistent_cache():
         try:
             with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # 恢复 cache_store
-                raw_cache = data.get("cache_store", {})
-                # 过滤掉过期的
-                now = time.time()
-                cache_store = {k: v for k, v in raw_cache.items() if v.get("expires_at", 0) > now}
+                # 恢复 cache_store (不再在启动时过滤过期的，保留作为兜底)
+                cache_store = data.get("cache_store", {})
                 fund_info_cache = data.get("fund_info_cache", {})
                 stock_info_cache = data.get("stock_info_cache", {})
                 logger.info(f"Loaded {len(cache_store)} cached funds, {len(fund_info_cache)} fund names, and {len(stock_info_cache)} stock info entries")

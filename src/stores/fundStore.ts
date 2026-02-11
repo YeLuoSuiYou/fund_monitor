@@ -1,4 +1,5 @@
 import { create } from "zustand"
+import { persist } from "zustand/middleware"
 import { fetchFundGzEstimate, isValuationError, type FundGzEstimate } from "@/utils/fundGz"
 import { buildFundEstimate, type FundEstimate } from "@/utils/estimate"
 import { fetchFundHoldings, recordIntradayValuation } from "@/utils/holdingsApi"
@@ -89,16 +90,18 @@ async function checkBackendHealth(baseUrl: string, timeoutMs = 1500): Promise<bo
   }
 }
 
-export const useFundStore = create<FundStore>((set, get) => ({
-  status: "idle",
-  errorMessage: null,
-  lastUpdatedAt: null,
-  lastRefreshStartedAt: null,
-  summary: emptySummary,
-  funds: {},
+export const useFundStore = create<FundStore>()(
+  persist(
+    (set, get) => ({
+      status: "idle",
+      errorMessage: null,
+      lastUpdatedAt: null,
+      lastRefreshStartedAt: null,
+      summary: emptySummary,
+      funds: {},
 
-  refreshAll: async (codes: string[], options = {}) => {
-    const current = get()
+      refreshAll: async (codes: string[], options = {}) => {
+        const current = get()
     if (current.status === "loading") return
     const now = Date.now()
     if (typeof navigator !== "undefined" && navigator.onLine === false) {
@@ -469,12 +472,21 @@ export const useFundStore = create<FundStore>((set, get) => ({
   },
 
   clearData: () =>
-    set(() => ({
-      status: "idle",
-      errorMessage: null,
-      lastUpdatedAt: null,
-      lastRefreshStartedAt: null,
-      summary: emptySummary,
-      funds: {},
-    })),
-}))
+        set(() => ({
+          status: "idle",
+          errorMessage: null,
+          lastUpdatedAt: null,
+          lastRefreshStartedAt: null,
+          summary: emptySummary,
+          funds: {},
+        })),
+    }),
+    {
+      name: "fund_monitor_data_v1",
+      partialize: (state) => ({
+        funds: state.funds,
+        lastUpdatedAt: state.lastUpdatedAt,
+      }),
+    }
+  )
+)
