@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 FUND_CODE_RE = re.compile(r"^\d{6}$")
 INTRADAY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-SINA_SYMBOL_RE = re.compile(r"^(sh|sz|bj)\d{6}$", re.IGNORECASE)
+SINA_SYMBOL_RE = re.compile(r"^((s_)?(sh|sz|bj)\d{6})$", re.IGNORECASE)
 
 def resolve_cors_origins() -> List[str]:
     raw = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
@@ -78,6 +78,9 @@ def normalize_fund_codes(codes: List[str]) -> List[str]:
     for code in codes:
         c = str(code).strip()
         if not c or c in seen:
+            continue
+        if not FUND_CODE_RE.match(c):
+            logger.warning(f"Ignored invalid fund code in settings: {c}")
             continue
         seen.add(c)
         output.append(c)
@@ -204,8 +207,10 @@ def load_backtest_cache():
 
 def save_backtest_cache():
     try:
+        with data_lock:
+            payload = json.loads(json.dumps(backtest_cache_data))
         with open(BACKTEST_CACHE_FILE, "w") as f:
-            json.dump(backtest_cache_data, f)
+            json.dump(payload, f)
     except Exception as e:
         logger.error(f"Failed to save backtest cache: {e}")
 
@@ -775,37 +780,48 @@ def refresh_nav_snapshot(code: str, data: dict, now: float) -> dict:
 def get_holdings(code: str):
     now = time.time()
     code = validate_fund_code(code)
-    cached = cache_store.get(code)
+    should_save_cache = False
+    with data_lock:
+        cached = cache_store.get(code)
+        backoff = backoff_store.get(code)
+
     if cached and cached["expires_at"] > now:
         data = cached["data"]
         base_nav_date = data.get("baseNavDate")
         nav_checked_at = cached.get("nav_checked_at")
         if should_refresh_nav(base_nav_date, nav_checked_at, now):
             refreshed = refresh_nav_snapshot(code, data, now)
-            cached["data"] = refreshed
-            cached["fetched_at"] = now
-            cached["expires_at"] = now + CACHE_TTL_SEC
-            cached["nav_checked_at"] = now
-            save_persistent_cache()
+            with data_lock:
+                latest_cached = cache_store.get(code)
+                if latest_cached:
+                    latest_cached["data"] = refreshed
+                    latest_cached["fetched_at"] = now
+                    latest_cached["expires_at"] = now + CACHE_TTL_SEC
+                    latest_cached["nav_checked_at"] = now
+            should_save_cache = True
+            if should_save_cache:
+                save_persistent_cache()
             return {**refreshed, "cachedAt": now, "stale": False}
         return {**data, "cachedAt": cached["fetched_at"], "stale": False}
-    backoff = backoff_store.get(code)
+
     if cached and backoff and backoff["next_at"] > now:
         data = cached["data"]
         return {**data, "cachedAt": cached["fetched_at"], "stale": True}
     if backoff and backoff["next_at"] > now:
         raise HTTPException(status_code=429, detail="backoff")
+
     holdings = parse_latest_holdings(code)
     if not holdings:
         if cached:
             data = cached["data"]
             logger.info(f"Using stale cache for {code} as new fetch failed")
             return {**data, "cachedAt": cached["fetched_at"], "stale": True}
-        backoff = backoff_store.get(code, {"count": 0})
-        count = backoff["count"] + 1
+        with data_lock:
+            current_backoff = backoff_store.get(code, {"count": 0})
+            count = current_backoff["count"] + 1
+            backoff_store[code] = {"count": count, "next_at": now + min(FAIL_BASE_SEC * (2 ** (count - 1)), FAIL_MAX_SEC)}
         delay = min(FAIL_BASE_SEC * (2 ** (count - 1)), FAIL_MAX_SEC)
-        backoff_store[code] = {"count": count, "next_at": now + delay}
-        
+
         # 收集错误信息
         error_detail = "no holdings found"
         logger.error(f"Holdings fetch failed for {code}: {error_detail}, backoff for {delay}s")
@@ -820,7 +836,7 @@ def get_holdings(code: str):
         "code": code,
         "name": fund_name,
         "holdingsDate": holdings_date,
-        "cashRatio": cash_ratio,
+        "cashRatio": cash_ratio if cash_ratio is not None else 0,
         "baseNav": base_nav[0] if base_nav else None,
         "baseNavDate": base_nav[1] if base_nav else None,
         "navMetrics": base_nav[2] if base_nav else None,
@@ -829,13 +845,14 @@ def get_holdings(code: str):
         "actualDate": actual_info["actualDate"] if actual_info else None,
         "actualNav": actual_info["actualNav"] if actual_info else None,
     }
-    cache_store[code] = {
-        "data": data,
-        "fetched_at": now,
-        "expires_at": now + CACHE_TTL_SEC,
-        "nav_checked_at": now,
-    }
-    backoff_store.pop(code, None)
+    with data_lock:
+        cache_store[code] = {
+            "data": data,
+            "fetched_at": now,
+            "expires_at": now + CACHE_TTL_SEC,
+            "nav_checked_at": now,
+        }
+        backoff_store.pop(code, None)
     save_persistent_cache()
     return {**data, "cachedAt": now, "stale": False}
 
@@ -883,6 +900,13 @@ def post_user_settings(settings: dict):
         payload = UserSettingsPayload.parse_obj(settings).dict()
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
+    invalid_codes = [
+        str(code).strip()
+        for code in payload.get("fundCodes", [])
+        if str(code).strip() and not FUND_CODE_RE.match(str(code).strip())
+    ]
+    if invalid_codes:
+        raise HTTPException(status_code=422, detail=f"invalid fundCodes: {','.join(invalid_codes)}")
     payload["fundCodes"] = normalize_fund_codes(payload.get("fundCodes", []))
     with data_lock:
         user_settings_data = payload
@@ -1194,9 +1218,11 @@ def get_backtest_report(force_refresh: bool = False):
         return {"date": today, "results": []}
     
     # 检查缓存
-    if not force_refresh and today in backtest_cache_data:
+    with data_lock:
+        day_cache = backtest_cache_data.get(today, {})
+    if not force_refresh and day_cache:
         # 过滤掉不在当前列表中的基金
-        cached_results = [backtest_cache_data[today][c] for c in codes if c in backtest_cache_data[today]]
+        cached_results = [day_cache[c] for c in codes if c in day_cache]
         if len(cached_results) == len(codes):
             logger.info("Returning cached backtest report")
             return {"date": today, "results": cached_results}
@@ -1209,17 +1235,18 @@ def get_backtest_report(force_refresh: bool = False):
             results.append(res)
     
     # 更新缓存
-    if today not in backtest_cache_data:
-        backtest_cache_data[today] = {}
-    
-    for res in results:
-        backtest_cache_data[today][res["code"]] = res
-    
-    # 清理旧缓存（保留 7 天）
-    cutoff = (date.today() - timedelta(days=7)).isoformat()
-    for d in list(backtest_cache_data.keys()):
-        if d < cutoff:
-            del backtest_cache_data[d]
+    with data_lock:
+        if today not in backtest_cache_data:
+            backtest_cache_data[today] = {}
+
+        for res in results:
+            backtest_cache_data[today][res["code"]] = res
+
+        # 清理旧缓存（保留 7 天）
+        cutoff = (date.today() - timedelta(days=7)).isoformat()
+        for d in list(backtest_cache_data.keys()):
+            if d < cutoff:
+                del backtest_cache_data[d]
             
     save_backtest_cache()
     return {"date": today, "results": results}

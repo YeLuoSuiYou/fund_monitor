@@ -52,14 +52,22 @@ export default function FundDetail() {
     async function loadHistory() {
       try {
         setLoading(true)
-        const [historyRes, intradayRes] = await Promise.all([
+        const [historyRes, intradayRes] = await Promise.allSettled([
           fetchFundHistory(holdingsApiBaseUrl, code!),
           fetchIntradayValuation(holdingsApiBaseUrl, code!),
         ])
-        setHistory(historyRes.history)
-        setIntraday(intradayRes)
-      } catch (e) {
-        console.error("Failed to load history/intraday:", e)
+        if (historyRes.status === "fulfilled") {
+          setHistory(historyRes.value.history)
+        } else {
+          console.error("Failed to load history:", historyRes.reason)
+          setHistory([])
+        }
+        if (intradayRes.status === "fulfilled") {
+          setIntraday(intradayRes.value)
+        } else {
+          console.error("Failed to load intraday:", intradayRes.reason)
+          setIntraday([])
+        }
       } finally {
         setLoading(false)
       }
@@ -119,7 +127,7 @@ export default function FundDetail() {
         const [hh, mm] = p.time.split(":").map(Number)
         const totalMin = hh * 60 + mm
         const isMarketTime = (totalMin >= 9 * 60 + 15 && totalMin <= 11 * 60 + 30) || 
-                            (totalMin >= 13 * 60 && totalMin <= 15 * 5)
+                            (totalMin >= 13 * 60 && totalMin <= 15 * 60)
         if (!isMarketTime) return false
 
         if (!latest?.valuationSource) return true
@@ -395,18 +403,18 @@ export default function FundDetail() {
                 <div>
                   <div className="text-xs text-zinc-500">盘中估值</div>
                   <div className="text-2xl font-bold">
-                    {isMiddayBreak() ? "--" : (latest?.gsz?.toFixed(4) || "--")}
+                    {latest?.gsz?.toFixed(4) || "--"}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-zinc-500">估值涨跌幅</div>
-                  <div className={`text-xl font-bold ${isMiddayBreak() ? "text-zinc-500" : getDeltaClass(gszzlTone, colorRule)}`}>
-                    {isMiddayBreak() ? "休市中" : (latest?.gszzl != null ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : "--")}
+                  <div className={`text-xl font-bold ${latest?.gszzl != null ? getDeltaClass(gszzlTone, colorRule) : "text-zinc-500"}`}>
+                    {latest?.gszzl != null ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : (isMiddayBreak() ? "午间休市" : "--")}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs text-zinc-500">
-                  <div>估值来源：{isMiddayBreak() ? "--" : valuationSourceText}</div>
-                  <div>行情时间：{isMiddayBreak() ? "--" : quoteTimeText}</div>
+                  <div>估值来源：{valuationSourceText}</div>
+                  <div>行情时间：{isMiddayBreak() && quoteTimeText !== "--" ? `${quoteTimeText} (午休沿用)` : quoteTimeText}</div>
                 </div>
               </CardContent>
             </Card>

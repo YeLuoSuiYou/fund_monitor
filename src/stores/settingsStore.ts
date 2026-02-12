@@ -85,6 +85,11 @@ async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = SET
   const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     return await fetch(url, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时")
+    }
+    throw error
   } finally {
     window.clearTimeout(timer)
   }

@@ -92,7 +92,9 @@ export async function fetchIntradayValuation(baseUrl: string, code: string) {
   const endpoint = baseUrl.replace(/\/+$/, "")
   const url = `${endpoint}/intraday_valuation?code=${encodeURIComponent(code)}`
   const res = await fetchWithTimeout(url)
-  if (!res.ok) return []
+  if (!res.ok) {
+    throw createValuationError("network", `日内估值请求失败 HTTP ${res.status}`)
+  }
   return (await res.json()) as IntradayPoint[]
 }
 

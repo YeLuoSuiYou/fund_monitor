@@ -9,7 +9,7 @@ import { Switch } from "@/components/ui/Switch"
 import { useFundStore } from "@/stores/fundStore"
 import { useSettingsStore } from "@/stores/settingsStore"
 import { quoteSourceOptions } from "@/utils/quote"
-import { formatDate, formatDateTime, isTradingTime, isMiddayBreak } from "@/utils/time"
+import { formatDate, formatDateTime, isMiddayBreak } from "@/utils/time"
 import { fetchSinaProxy } from "@/utils/holdingsApi"
 import { cn } from "@/lib/utils"
 
@@ -415,9 +415,9 @@ export default function Home() {
                 const deltaCls = delta === null ? "text-zinc-500 dark:text-zinc-400" : getDeltaClass(deltaTone, colorRule)
 
                 const isBreak = isMiddayBreak()
-                const zfText = isBreak ? "休市中" : ((latest && latest.gszzl != null) ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : "--")
+                const zfText = (latest && latest.gszzl != null) ? `${latest.gszzl > 0 ? "+" : ""}${latest.gszzl.toFixed(2)}%` : (isBreak ? "午间休市" : "--")
                 const zfTone = (latest && latest.gszzl != null) ? getDeltaTone(latest.gszzl) : "flat"
-                const zfCls = isBreak ? "text-zinc-500 dark:text-zinc-400" : (latest ? getDeltaClass(zfTone, colorRule) : "text-zinc-500 dark:text-zinc-400")
+                const zfCls = latest?.gszzl != null ? getDeltaClass(zfTone, colorRule) : "text-zinc-500 dark:text-zinc-400"
 
                 const actualZzl = latest?.actualZzl ?? null
                 const actualDate = latest?.actualDate ?? null
@@ -437,8 +437,9 @@ export default function Home() {
 
                 const gztimeText = latest ? latest.gztime : "--"
                 const quoteTimeText = latest?.quoteTime ?? "--"
+                const quoteTimeDisplay = isBreak && latest?.quoteTime ? `${quoteTimeText} (午休沿用)` : quoteTimeText
                 const valuationSourceText = latest?.valuationSource === "eastmoney" ? "官方估值" : "持仓推算"
-                const gszText = isBreak ? "--" : (latest && latest.gsz !== null ? latest.gsz.toFixed(decimals) : "--")
+                const gszText = latest && latest.gsz !== null ? latest.gsz.toFixed(decimals) : "--"
                 const deltaText =
                   delta === null ? "--" : `${delta >= 0 ? "+" : ""}${delta.toFixed(decimals)}`
                 const coverageText = latest ? `${Math.round(latest.coverage * 100)}%` : "--"
@@ -590,7 +591,7 @@ export default function Home() {
                               <span>估值时间：{gztimeText}</span>
                             </div>
                             <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">估值来源：{valuationSourceText}</div>
-                            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">行情时间：{quoteTimeText}</div>
+                            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">行情时间：{quoteTimeDisplay}</div>
                             <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                               较上一笔：<span className={deltaCls}>{deltaText}</span>
                             </div>

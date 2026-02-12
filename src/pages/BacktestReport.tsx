@@ -22,6 +22,23 @@ type ReportResponse = {
   results: BacktestResult[]
 }
 
+const REQUEST_TIMEOUT_MS = 10000
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时")
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
 export default function BacktestReport() {
   const holdingsApiBaseUrl = useSettingsStore((s) => s.holdingsApiBaseUrl)
   const colorRule = useSettingsStore((s) => s.colorRule)
@@ -34,7 +51,9 @@ export default function BacktestReport() {
     try {
       setRefreshing(force)
       if (!force) setLoading(true)
-      const res = await fetch(`${holdingsApiBaseUrl.replace(/\/+$/, "")}/backtest_report${force ? "?force_refresh=true" : ""}`)
+      const res = await fetchWithTimeout(
+        `${holdingsApiBaseUrl.replace(/\/+$/, "")}/backtest_report${force ? "?force_refresh=true" : ""}`,
+      )
       if (!res.ok) throw new Error("获取报告失败")
       const json = await res.json()
       setData(json)

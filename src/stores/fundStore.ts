@@ -4,7 +4,7 @@ import { fetchFundGzEstimate, isValuationError, type FundGzEstimate } from "@/ut
 import { buildFundEstimate, type FundEstimate } from "@/utils/estimate"
 import { fetchFundHoldings, recordIntradayValuation } from "@/utils/holdingsApi"
 import { fetchStockQuotes, normalizeQuoteSymbol, type QuoteSourceId, type StockQuote } from "@/utils/quote"
-import { isTradingTime, isMiddayBreak } from "@/utils/time"
+import { isTradingTime } from "@/utils/time"
 
 export type LoadStatus = "idle" | "loading" | "success" | "error"
 
@@ -63,6 +63,7 @@ function normalizeCodes(codes: string[]): string[] {
 let networkBackoffUntil = 0
 const networkBackoffMs = 15000
 const intradaySentCache: Record<string, string> = {}
+const API_REQUEST_TIMEOUT_MS = 7000
 
 const emptySummary: RefreshSummary = { total: 0, success: 0, error: 0 }
 
@@ -85,6 +86,26 @@ async function checkBackendHealth(baseUrl: string, timeoutMs = 1500): Promise<bo
     return res.ok
   } catch {
     return false
+  } finally {
+    if (id !== undefined) window.clearTimeout(id)
+  }
+}
+
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs = API_REQUEST_TIMEOUT_MS): Promise<T> {
+  let id: number | undefined
+  try {
+    const controller = new AbortController()
+    id = window.setTimeout(() => controller.abort(), timeoutMs)
+    const res = await fetch(url, { signal: controller.signal })
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`)
+    }
+    return (await res.json()) as T
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("timeout")
+    }
+    throw e
   } finally {
     if (id !== undefined) window.clearTimeout(id)
   }
@@ -261,7 +282,9 @@ export const useFundStore = create<FundStore>()(
     if (valuationMode === "smart") {
       const bestSourceResults = await Promise.allSettled(
         list.map((code) =>
-          fetch(`${holdingsApiBaseUrl.replace(/\/+$/, "")}/best_source?code=${code}`).then((r) => r.json()),
+          fetchJsonWithTimeout<{ code: string; bestSource?: string }>(
+            `${holdingsApiBaseUrl.replace(/\/+$/, "")}/best_source?code=${code}`,
+          ),
         ),
       )
       bestSourceResults.forEach((result, idx) => {
