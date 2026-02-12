@@ -64,6 +64,7 @@ let networkBackoffUntil = 0
 const networkBackoffMs = 15000
 const intradaySentCache: Record<string, string> = {}
 const API_REQUEST_TIMEOUT_MS = 7000
+const HEALTHCHECK_TIMEOUT_MS = 3000
 
 const emptySummary: RefreshSummary = { total: 0, success: 0, error: 0 }
 
@@ -75,7 +76,7 @@ function getTodayString(): string {
   return `${yyyy}-${mm}-${dd}`
 }
 
-async function checkBackendHealth(baseUrl: string, timeoutMs = 1500): Promise<boolean> {
+async function checkBackendHealth(baseUrl: string, timeoutMs = HEALTHCHECK_TIMEOUT_MS): Promise<boolean> {
   if (!baseUrl) return false
   let id: number | undefined
   try {
@@ -205,6 +206,8 @@ export const useFundStore = create<FundStore>()(
         cashRatio: number
         baseNav: number | null
         holdingsDate?: string
+        fundType?: string | null
+        benchmarkSymbol?: string | null
         stale?: boolean
         cachedAt?: number
         fundName?: string
@@ -225,9 +228,14 @@ export const useFundStore = create<FundStore>()(
       if (result.status !== "fulfilled") {
         const reason = result.reason
         let msg = "持仓接口失败"
-        if (reason instanceof Error) {
+        if (isValuationError(reason)) {
+          if (reason.code === "timeout") msg = "持仓请求超时"
+          else if (reason.code === "network") msg = "无法连接服务"
+          else if (reason.code === "invalid_payload") msg = "持仓数据异常"
+        } else if (reason instanceof Error) {
           if (/HTTP\s+404/.test(reason.message)) msg = "持仓未找到"
           else if (/HTTP\s+429/.test(reason.message)) msg = "请求过快(退避中)"
+          else if (/timeout|超时/i.test(reason.message)) msg = "持仓请求超时"
           else if (reason.message.includes("fetch")) msg = "无法连接服务"
         }
         fundErrors[code] = msg
@@ -258,6 +266,8 @@ export const useFundStore = create<FundStore>()(
         cashRatio,
         baseNav: baseNav !== null && Number.isFinite(Number(baseNav)) ? Number(baseNav) : null,
         holdingsDate: payload.holdingsDate,
+        fundType: payload.fundType ?? null,
+        benchmarkSymbol: payload.benchmarkSymbol ?? null,
         stale: payload.stale ?? false,
         cachedAt: Number.isFinite(cachedAt) ? cachedAt : undefined,
         fundName: payload.name,
@@ -306,6 +316,9 @@ export const useFundStore = create<FundStore>()(
       if (!config) continue
       for (const item of config.holdings) {
         symbols.add(item.symbol)
+      }
+      if (config.benchmarkSymbol) {
+        symbols.add(config.benchmarkSymbol)
       }
     }
 
@@ -395,6 +408,9 @@ export const useFundStore = create<FundStore>()(
           holdings: config?.holdings ?? [],
           valuationSource: "eastmoney",
           quoteTime: official.gztime,
+          fundType: config?.fundType ?? null,
+          benchmarkSymbol: config?.benchmarkSymbol ?? null,
+          strategyVersion: "official",
         }
         success += 1
         nextFunds[code] = {
@@ -445,6 +461,13 @@ export const useFundStore = create<FundStore>()(
         cachedAt: config.cachedAt,
         actualZzl: config.actualZzl,
         actualDate: config.actualDate,
+        fundType: config.fundType ?? null,
+        benchmarkSymbol: config.benchmarkSymbol ?? null,
+        benchmarkReturn:
+          config.benchmarkSymbol && quotes[config.benchmarkSymbol] && quotes[config.benchmarkSymbol].prevClose > 0
+            ? (quotes[config.benchmarkSymbol].price - quotes[config.benchmarkSymbol].prevClose) / quotes[config.benchmarkSymbol].prevClose
+            : null,
+        strategyVersion: "improved_v1",
       })
       if (estimate.coverage <= 0) {
         const msg = "行情缺失"

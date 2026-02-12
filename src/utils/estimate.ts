@@ -20,6 +20,9 @@ export type FundEstimate = {
   holdings?: HoldingItem[]
   valuationSource?: "eastmoney" | "holdings"
   quoteTime?: string | null
+  fundType?: string | null
+  benchmarkSymbol?: string | null
+  strategyVersion?: string
 }
 
 export type NavMetrics = {
@@ -30,12 +33,50 @@ export type NavMetrics = {
   maxDrawdown?: number | null
 }
 
+function inferBenchmarkSymbol(name?: string, fundType?: string | null): string {
+  const text = `${name ?? ""} ${fundType ?? ""}`
+  if (/中证1000|1000/.test(text)) return "sh000852"
+  if (/中证500|500/.test(text)) return "sh000905"
+  if (/上证50|50/.test(text)) return "sh000016"
+  if (/创业板/.test(text)) return "sz399006"
+  if (/深证|深成/.test(text)) return "sz399001"
+  return "sh000300"
+}
+
+function inferHoldingsWeight(fundType?: string | null): number {
+  const text = String(fundType ?? "")
+  if (/指数|ETF/.test(text)) return 0.25
+  if (/混合/.test(text)) return 0.65
+  return 0.8
+}
+
+function parseHoldingsDateToTs(label?: string): number | null {
+  if (!label) return null
+  const q = label.match(/(\d{4})年\s*([1-4])季度/)
+  if (q) {
+    const year = Number(q[1])
+    const quarter = Number(q[2])
+    const month = quarter * 3
+    return new Date(year, month, 0, 23, 59, 59).getTime()
+  }
+  const direct = Date.parse(label.replace(/[./]/g, "-"))
+  return Number.isFinite(direct) ? direct : null
+}
+
+function computeFreshnessFactor(holdingsDate?: string): number {
+  const ts = parseHoldingsDateToTs(holdingsDate)
+  if (!ts) return 1
+  const ageDays = Math.max(0, (Date.now() - ts) / (24 * 3600 * 1000))
+  if (ageDays <= 45) return 1
+  return Math.max(0.65, 1 - ((ageDays - 45) / 365) * 0.35)
+}
+
 export function buildFundEstimate(params: {
   code: string
   name?: string
   holdings: HoldingItem[]
   quotes: Record<string, StockQuote>
-  cashRatio: number // 0-100 之间的数值
+  cashRatio: number // 0-1 之间的数值
   baseNav: number | null
   navMetrics?: NavMetrics | null
   holdingsDate?: string
@@ -43,6 +84,10 @@ export function buildFundEstimate(params: {
   cachedAt?: number
   actualZzl?: number | null
   actualDate?: string | null
+  fundType?: string | null
+  benchmarkSymbol?: string | null
+  benchmarkReturn?: number | null
+  strategyVersion?: string
 }): FundEstimate {
   // 1. 计算已匹配到的前十大权重之和
   let matchedWeight = 0
@@ -60,22 +105,25 @@ export function buildFundEstimate(params: {
     matchedWeight += h.weight
   }
 
-  /**
-   * 2. 核心算法改进：全仓缩放模型
-   * 
-   * 现状：前十大往往只占 40%-60%，直接求和会大幅低估波动。
-   * 假设：非重仓股的平均表现与重仓股一致。
-   * 公式：TotalReturn = (MatchedReturnContribution / MatchedWeight) * EquityRatio
-   * 其中 EquityRatio = 1 - CashRatio
-   */
-  const cashRatioDecimal = (params.cashRatio || 0) / 100
+  // cashRatio 已经在 store 中归一为 0-1
+  const cashRatioDecimal = Number.isFinite(params.cashRatio) ? Math.min(1, Math.max(0, params.cashRatio)) : 0
   const equityRatio = Math.max(0, 1 - cashRatioDecimal)
-  
-  let finalReturn = 0
-  if (matchedWeight > 0) {
-    // 先计算重仓股部分的平均涨幅，再乘以总股票仓位
-    finalReturn = (matchedReturnContribution / matchedWeight) * equityRatio
-  }
+
+  const holdingsDrivenReturn = matchedWeight > 0 ? (matchedReturnContribution / matchedWeight) * equityRatio : null
+  const benchmarkSymbol = params.benchmarkSymbol ?? inferBenchmarkSymbol(params.name, params.fundType)
+  const proxyStockReturn = Number.isFinite(params.benchmarkReturn as number)
+    ? (params.benchmarkReturn as number)
+    : (matchedWeight > 0 ? matchedReturnContribution / matchedWeight : 0)
+  const proxyDrivenReturn = proxyStockReturn * equityRatio
+
+  const freshness = computeFreshnessFactor(params.holdingsDate)
+  const holdingsWeightBase = inferHoldingsWeight(params.fundType)
+  const holdingsWeight = holdingsDrivenReturn === null ? 0 : holdingsWeightBase * freshness
+  const proxyWeight = 1 - holdingsWeight
+
+  let finalReturn = holdingsDrivenReturn === null
+    ? proxyDrivenReturn
+    : holdingsDrivenReturn * holdingsWeight + proxyDrivenReturn * proxyWeight
 
   const gszzl = Number.isFinite(finalReturn) ? finalReturn * 100 : null
   const gsz =
@@ -103,5 +151,8 @@ export function buildFundEstimate(params: {
     holdings: params.holdings,
     valuationSource: "holdings",
     quoteTime: latestQuoteTime || null,
+    fundType: params.fundType ?? null,
+    benchmarkSymbol,
+    strategyVersion: params.strategyVersion ?? "improved_v1",
   }
 }

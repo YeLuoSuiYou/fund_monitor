@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Link } from "react-router-dom"
 import { ArrowLeft, RefreshCw, AlertCircle, CheckCircle2, XCircle, Info } from "lucide-react"
 import { Button } from "@/components/ui/Button"
@@ -10,16 +10,33 @@ import { cn } from "@/lib/utils"
 type BacktestResult = {
   code: string
   name: string
+  fundType?: string | null
+  benchmarkSymbol?: string | null
+  strategyVersion?: string
   mae: number
+  rmse?: number
   hit_rate_02: number
   hit_rate_05: number
   max_err: number
+  bias?: number
   samples: number
+  baseline?: {
+    mae: number
+    rmse: number
+    hit_rate_02: number
+    hit_rate_05: number
+    max_err: number
+    bias: number
+  } | null
 }
 
 type ReportResponse = {
   date: string
   results: BacktestResult[]
+  pending?: boolean
+  total?: number
+  completed?: number
+  updatedAt?: string
 }
 
 const REQUEST_TIMEOUT_MS = 10000
@@ -41,13 +58,12 @@ async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = REQ
 
 export default function BacktestReport() {
   const holdingsApiBaseUrl = useSettingsStore((s) => s.holdingsApiBaseUrl)
-  const colorRule = useSettingsStore((s) => s.colorRule)
   const [data, setData] = useState<ReportResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const fetchReport = async (force = false) => {
+  const fetchReport = useCallback(async (force = false) => {
     try {
       setRefreshing(force)
       if (!force) setLoading(true)
@@ -64,11 +80,19 @@ export default function BacktestReport() {
       setLoading(false)
       setRefreshing(false)
     }
-  }
+  }, [holdingsApiBaseUrl])
 
   useEffect(() => {
     fetchReport()
-  }, [holdingsApiBaseUrl])
+  }, [fetchReport])
+
+  useEffect(() => {
+    if (!data?.pending) return
+    const id = window.setTimeout(() => {
+      fetchReport(false)
+    }, 2000)
+    return () => window.clearTimeout(id)
+  }, [data?.pending, fetchReport, data?.completed])
 
   const getRating = (mae: number) => {
     if (mae < 0.15) return { label: "极准", tone: "success", icon: CheckCircle2 }
@@ -81,6 +105,11 @@ export default function BacktestReport() {
     if (mae < 0.3) return "text-emerald-500"
     if (mae < 0.5) return "text-amber-500"
     return "text-rose-500"
+  }
+
+  const formatDelta = (value: number | undefined) => {
+    if (!Number.isFinite(value)) return "--"
+    return `${(value as number) > 0 ? "+" : ""}${(value as number).toFixed(3)}`
   }
 
   return (
@@ -125,7 +154,7 @@ export default function BacktestReport() {
                 <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
               </CardContent>
             </Card>
-          ) : data?.results.length === 0 ? (
+          ) : data?.results.length === 0 && !data?.pending ? (
             <div className="flex h-64 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-zinc-200 dark:border-zinc-800">
               <p className="text-sm text-zinc-500">尚未添加任何基金</p>
               <Link to="/settings">
@@ -134,6 +163,11 @@ export default function BacktestReport() {
             </div>
           ) : (
             <div className="space-y-4">
+              {data?.pending ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+                  回测任务后台运行中：{data.completed ?? 0}/{data.total ?? data.results.length}。页面将自动刷新结果。
+                </div>
+              ) : null}
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {data?.results.map((res) => {
                   const rating = getRating(res.mae)
@@ -159,11 +193,16 @@ export default function BacktestReport() {
                             <p className={cn("text-lg font-bold tabular-nums", getDeltaClass(res.mae))}>
                               {res.mae.toFixed(3)}%
                             </p>
+                            {res.baseline ? (
+                              <p className="text-[10px] text-zinc-500">
+                                较基线: {formatDelta(res.mae - res.baseline.mae)}%
+                              </p>
+                            ) : null}
                           </div>
                           <div>
-                            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">最大偏差</p>
+                            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">RMSE/最大偏差</p>
                             <p className="text-lg font-semibold tabular-nums text-zinc-700 dark:text-zinc-300">
-                              {res.max_err.toFixed(2)}%
+                              {(res.rmse ?? res.max_err).toFixed(2)}% / {res.max_err.toFixed(2)}%
                             </p>
                           </div>
                           <div>
@@ -173,9 +212,9 @@ export default function BacktestReport() {
                             </p>
                           </div>
                           <div>
-                            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">样本天数</p>
+                            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">样本/偏置</p>
                             <p className="text-sm font-medium tabular-nums">
-                              {res.samples} 天
+                              {res.samples} 天 / {formatDelta(res.bias)}%
                             </p>
                           </div>
                         </div>
@@ -190,6 +229,9 @@ export default function BacktestReport() {
                               className="h-full bg-emerald-500 transition-all" 
                               style={{ width: `${res.hit_rate_05}%` }}
                             />
+                          </div>
+                          <div className="mt-2 text-[10px] text-zinc-500">
+                            策略: {res.strategyVersion ?? "baseline"} | 基准: {res.benchmarkSymbol ?? "--"} | 类型: {res.fundType ?? "--"}
                           </div>
                         </div>
                       </CardContent>

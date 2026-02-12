@@ -31,6 +31,11 @@ cache.json
 user_settings.json
 intraday_history.json
 backtest_cache.json
+api/accuracy_history.json
+api/backtest_cache.json
+
+# Cursor local state (keep project skills tracked)
+.cursor/plans/
 
 # Environment variables
 .env

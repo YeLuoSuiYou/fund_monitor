@@ -53,6 +53,7 @@ NAV_CHECK_INTERVAL_SEC = 30 * 60
 cache_store = {}
 backoff_store = {}
 fund_info_cache = {} # 缓存基金名称等信息
+fund_profile_cache = {} # 缓存基金类型与基准信息
 stock_info_cache = {} # 缓存股票所属行业等信息
 user_settings_data = {} # 存储基金列表等用户配置
 intraday_history_data = {} # 存储日内估值点 { code: { date: [ { time, value } ] } }
@@ -85,6 +86,20 @@ def normalize_fund_codes(codes: List[str]) -> List[str]:
         seen.add(c)
         output.append(c)
     return output
+
+def infer_benchmark_symbol(fund_name: Optional[str], fund_type: Optional[str]) -> str:
+    text = f"{fund_name or ''} {fund_type or ''}"
+    if "中证1000" in text or "1000" in text:
+        return "sh000852"
+    if "中证500" in text or "500" in text:
+        return "sh000905"
+    if "上证50" in text or "50" in text:
+        return "sh000016"
+    if "创业板" in text:
+        return "sz399006"
+    if "深证" in text or "深成" in text:
+        return "sz399001"
+    return "sh000300"
 
 def validate_fund_code(code: str) -> str:
     normalized = str(code).strip()
@@ -131,8 +146,13 @@ def call_ak(func, *args, **kwargs):
     带锁调用 akshare 接口，确保线程安全并防止 V8 崩溃
     """
     with ak_lock:
+        started = time.time()
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            elapsed_ms = int((time.time() - started) * 1000)
+            if elapsed_ms > 1500:
+                logger.info(f"akshare slow call ({func.__name__}): {elapsed_ms}ms")
+            return result
         except Exception as e:
             logger.error(f"akshare call error ({func.__name__}): {e}")
             return None
@@ -177,6 +197,14 @@ def load_persistent_cache():
 accuracy_history_data = {} # { code: { date: { "eastmoney": error, "holdings": error } } }
 ACCURACY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "accuracy_history.json")
 backtest_cache_data = {} # { date: { code: { mae, hit_rate_02, hit_rate_05, max_err } } }
+backtest_job_state = {
+    "running": False,
+    "date": None,
+    "total": 0,
+    "completed": 0,
+    "startedAt": None,
+    "updatedAt": None,
+}
 
 def load_accuracy_history():
     global accuracy_history_data
@@ -213,6 +241,53 @@ def save_backtest_cache():
             json.dump(payload, f)
     except Exception as e:
         logger.error(f"Failed to save backtest cache: {e}")
+
+
+def run_backtest_job(today: str, codes: List[str], force_refresh: bool):
+    logger.info(f"Backtest job started for {len(codes)} funds (date={today}, force={force_refresh})")
+    save_counter = 0
+    for code in codes:
+        res = run_single_backtest(code)
+        with data_lock:
+            if today not in backtest_cache_data:
+                backtest_cache_data[today] = {}
+            if res:
+                backtest_cache_data[today][res["code"]] = res
+            backtest_job_state["completed"] = int(backtest_job_state.get("completed", 0)) + 1
+            backtest_job_state["updatedAt"] = datetime.utcnow().isoformat()
+        save_counter += 1
+        if save_counter % 5 == 0:
+            save_backtest_cache()
+
+    with data_lock:
+        cutoff = (date.today() - timedelta(days=7)).isoformat()
+        for d in list(backtest_cache_data.keys()):
+            if d < cutoff:
+                del backtest_cache_data[d]
+        backtest_job_state["running"] = False
+        backtest_job_state["updatedAt"] = datetime.utcnow().isoformat()
+
+    save_backtest_cache()
+    logger.info(f"Backtest job finished (date={today})")
+
+
+def ensure_backtest_job(today: str, codes: List[str], force_refresh: bool):
+    with data_lock:
+        running = bool(backtest_job_state.get("running"))
+        running_date = backtest_job_state.get("date")
+        if running and running_date == today:
+            return
+        if force_refresh and today in backtest_cache_data:
+            backtest_cache_data[today] = {}
+        backtest_job_state["running"] = True
+        backtest_job_state["date"] = today
+        backtest_job_state["total"] = len(codes)
+        backtest_job_state["completed"] = 0
+        backtest_job_state["startedAt"] = datetime.utcnow().isoformat()
+        backtest_job_state["updatedAt"] = backtest_job_state["startedAt"]
+
+    t = threading.Thread(target=run_backtest_job, args=(today, list(codes), force_refresh), daemon=True)
+    t.start()
 
 load_accuracy_history()
 load_backtest_cache()
@@ -374,6 +449,39 @@ def get_fund_name(code: str):
 
 
 _all_funds_df = None
+
+def get_fund_profile(code: str) -> dict:
+    if code in fund_profile_cache:
+        return fund_profile_cache[code]
+
+    profile = {"name": None, "fundType": None, "benchmarkSymbol": "sh000300"}
+    name = get_fund_name(code)
+    if name:
+        profile["name"] = name
+
+    global _all_funds_df
+    try:
+        if _all_funds_df is None:
+            _all_funds_df = call_ak(ak.fund_name_em)
+        if _all_funds_df is not None and not _all_funds_df.empty:
+            code_col = pick_col(_all_funds_df.columns, ["基金代码", "代码"])
+            type_col = pick_col(_all_funds_df.columns, ["基金类型", "类型"])
+            name_col = pick_col(_all_funds_df.columns, ["基金简称", "名称"])
+            if code_col:
+                match = _all_funds_df[_all_funds_df[code_col].astype(str).str.strip() == str(code).strip()]
+                if not match.empty:
+                    row = match.iloc[0]
+                    if name_col and not profile["name"]:
+                        profile["name"] = str(row.get(name_col, "")).strip() or None
+                    if type_col:
+                        fund_type = str(row.get(type_col, "")).strip()
+                        profile["fundType"] = fund_type or None
+    except Exception as e:
+        logger.warning(f"Failed to fetch fund profile for {code}: {e}")
+
+    profile["benchmarkSymbol"] = infer_benchmark_symbol(profile.get("name"), profile.get("fundType"))
+    fund_profile_cache[code] = profile
+    return profile
 
 
 def find_target_etf_code(feeder_code: str, feeder_name: str):
@@ -779,6 +887,7 @@ def refresh_nav_snapshot(code: str, data: dict, now: float) -> dict:
 @app.get("/holdings")
 def get_holdings(code: str):
     now = time.time()
+    started = time.time()
     code = validate_fund_code(code)
     should_save_cache = False
     with data_lock:
@@ -829,12 +938,15 @@ def get_holdings(code: str):
     cash_ratio, cash_date = parse_cash_ratio(code)
     base_nav = parse_base_nav(code)
     actual_info = parse_actual_data(code)
-    fund_name = get_fund_name(code)
+    profile = get_fund_profile(code)
+    fund_name = profile.get("name") or get_fund_name(code)
     
     holdings_date = holdings.get("holdingsDate") or cash_date
     data = {
         "code": code,
         "name": fund_name,
+        "fundType": profile.get("fundType"),
+        "benchmarkSymbol": profile.get("benchmarkSymbol"),
         "holdingsDate": holdings_date,
         "cashRatio": cash_ratio if cash_ratio is not None else 0,
         "baseNav": base_nav[0] if base_nav else None,
@@ -854,6 +966,10 @@ def get_holdings(code: str):
         }
         backoff_store.pop(code, None)
     save_persistent_cache()
+    logger.info(
+        f"Holdings request completed for {code} in {int((time.time() - started) * 1000)}ms "
+        f"(holdings={len(data['holdings'])}, fundType={data.get('fundType')})"
+    )
     return {**data, "cachedAt": now, "stale": False}
 
 
@@ -1114,36 +1230,129 @@ def get_recommended_source(code: str):
     return {"code": code, "bestSource": get_best_source(code)}
 
 
+def parse_holdings_date(holdings_date: Optional[str]) -> Optional[date]:
+    if not holdings_date:
+        return None
+    q = re.search(r"(\d{4})年\s*([1-4])季度", holdings_date)
+    if q:
+        year = int(q.group(1))
+        quarter = int(q.group(2))
+        month = quarter * 3
+        month_end = date(year, month, 1)
+        while True:
+            try:
+                return date(month_end.year, month_end.month, 31)
+            except ValueError:
+                try:
+                    return date(month_end.year, month_end.month, 30)
+                except ValueError:
+                    return date(month_end.year, month_end.month, 28)
+    try:
+        parsed = pd.to_datetime(holdings_date, errors="coerce")
+        if pd.notna(parsed):
+            return parsed.date()
+    except Exception:
+        pass
+    return None
+
+
+def compute_holdings_freshness(holdings_date: Optional[str], target_date: date) -> float:
+    report_date = parse_holdings_date(holdings_date)
+    if not report_date:
+        return 1.0
+    age_days = max(0, (target_date - report_date).days)
+    if age_days <= 45:
+        return 1.0
+    return max(0.65, 1 - ((age_days - 45) / 365) * 0.35)
+
+
+def infer_holdings_weight_by_type(fund_type: Optional[str]) -> float:
+    text = str(fund_type or "")
+    if "指数" in text or "ETF" in text:
+        return 0.25
+    if "混合" in text:
+        return 0.65
+    return 0.8
+
+
+def fetch_index_returns(symbol: str, start_date: str, end_date: str) -> Dict[date, float]:
+    df = call_ak(ak.stock_zh_index_daily, symbol=symbol)
+    if df is None or df.empty:
+        return {}
+    col_date = pick_col(df.columns, ["date", "日期"])
+    col_close = pick_col(df.columns, ["close", "收盘"])
+    if not col_date or not col_close:
+        return {}
+    df = df[[col_date, col_close]].copy()
+    df[col_date] = pd.to_datetime(df[col_date], errors="coerce")
+    df[col_close] = pd.to_numeric(df[col_close], errors="coerce")
+    df = df.dropna(subset=[col_date, col_close]).sort_values(col_date)
+    if df.empty:
+        return {}
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date)
+    df = df[(df[col_date] >= start_ts) & (df[col_date] <= end_ts)]
+    if df.empty:
+        return {}
+    df["ret"] = df[col_close].pct_change()
+    returns: Dict[date, float] = {}
+    for _, row in df.iterrows():
+        d = row[col_date]
+        r = row["ret"]
+        if pd.notna(r):
+            returns[d.date()] = float(r)
+    return returns
+
+
+def summarize_errors(errors: List[float], diffs: List[float]) -> Dict[str, float]:
+    arr = np.array(errors, dtype=float)
+    diff_arr = np.array(diffs, dtype=float)
+    return {
+        "mae": float(np.mean(arr)),
+        "rmse": float(np.sqrt(np.mean(diff_arr ** 2))),
+        "hit_rate_02": float(np.mean(arr <= 0.2) * 100),
+        "hit_rate_05": float(np.mean(arr <= 0.5) * 100),
+        "max_err": float(np.max(arr)),
+        "bias": float(np.mean(diff_arr)),
+    }
+
+
 def run_single_backtest(code: str, days=30):
     """
     对单个基金运行过去 30 天的回测
     """
+    started = time.time()
     try:
         # 1. 获取持仓和基本信息
         holdings_data = parse_latest_holdings(code)
         if not holdings_data: return None
-        
+
+        profile = get_fund_profile(code)
+        benchmark_symbol = profile.get("benchmarkSymbol", "sh000300")
+        fund_type = profile.get("fundType")
+
         cash_ratio, _ = parse_cash_ratio(code)
         cash_ratio = (cash_ratio or 0) / 100
         equity_ratio = 1 - cash_ratio
-        
+
         # 2. 获取基金历史净值
         df_nav = call_ak(ak.fund_open_fund_info_em, symbol=code, indicator="单位净值走势")
         if df_nav is None or df_nav.empty: return None
-        
+
         col_date = pick_col(df_nav.columns, ["净值日期", "日期"])
-        col_nav = pick_col(df_nav.columns, ["单位净值", "净值"])
         col_zzl = pick_col(df_nav.columns, ["日增长率", "增长率"])
-        
+        if not col_date or not col_zzl:
+            return None
+
         df_nav[col_date] = pd.to_datetime(df_nav[col_date])
         df_nav = df_nav.sort_values(col_date).tail(days)
-        
+
         if df_nav.empty: return None
-        
+
         # 3. 获取重仓股历史行情
         start_date = df_nav[col_date].min().strftime("%Y%m%d")
         end_date = df_nav[col_date].max().strftime("%Y%m%d")
-        
+
         stock_histories = {}
         for h in holdings_data["holdings"]:
             symbol = h["symbol"]
@@ -1160,9 +1369,15 @@ def run_single_backtest(code: str, days=30):
                 df_s = df_s.sort_values("日期")
                 df_s["ret"] = df_s["收盘"].pct_change()
                 stock_histories[symbol] = df_s
-        
-        # 4. 计算每日误差
-        errors = []
+
+        index_returns = fetch_index_returns(benchmark_symbol, start_date, end_date)
+
+        # 4. 计算每日误差（baseline vs improved）
+        baseline_errors: List[float] = []
+        baseline_diffs: List[float] = []
+        improved_errors: List[float] = []
+        improved_diffs: List[float] = []
+
         for _, row in df_nav.iterrows():
             d = row[col_date]
             actual = row[col_zzl]
@@ -1172,7 +1387,7 @@ def run_single_backtest(code: str, days=30):
                 except Exception as e:
                     logger.debug(f"Failed to parse backtest daily return for {code}: {e}")
                     continue
-            
+
             matched_w = 0
             contrib = 0
             for h in holdings_data["holdings"]:
@@ -1186,26 +1401,54 @@ def run_single_backtest(code: str, days=30):
                         if pd.notna(s_ret):
                             matched_w += w
                             contrib += w * s_ret
-            
-            if matched_w > 0:
-                est = (contrib / matched_w) * equity_ratio * 100
-                errors.append(abs(est - actual))
-        
-        if not errors: return None
-        
-        errors_arr = np.array(errors)
+
+            if matched_w <= 0:
+                continue
+
+            baseline_est = (contrib / matched_w) * equity_ratio * 100
+            baseline_diff = baseline_est - actual
+            baseline_diffs.append(baseline_diff)
+            baseline_errors.append(abs(baseline_diff))
+
+            index_ret = index_returns.get(d.date())
+            proxy_ret = index_ret if index_ret is not None else (contrib / matched_w)
+            proxy_est = proxy_ret * equity_ratio * 100
+
+            freshness = compute_holdings_freshness(holdings_data.get("holdingsDate"), d.date())
+            holdings_weight = infer_holdings_weight_by_type(fund_type) * freshness
+            holdings_weight = max(0, min(1, holdings_weight))
+            improved_est = baseline_est * holdings_weight + proxy_est * (1 - holdings_weight)
+
+            improved_diff = improved_est - actual
+            improved_diffs.append(improved_diff)
+            improved_errors.append(abs(improved_diff))
+
+        if not improved_errors:
+            return None
+
+        baseline_metrics = summarize_errors(baseline_errors, baseline_diffs) if baseline_errors else None
+        improved_metrics = summarize_errors(improved_errors, improved_diffs)
+
         return {
             "code": code,
-            "name": get_fund_name(code),
-            "mae": float(np.mean(errors_arr)),
-            "hit_rate_02": float(np.mean(errors_arr <= 0.2) * 100),
-            "hit_rate_05": float(np.mean(errors_arr <= 0.5) * 100),
-            "max_err": float(np.max(errors_arr)),
-            "samples": len(errors)
+            "name": profile.get("name") or get_fund_name(code),
+            "fundType": fund_type,
+            "benchmarkSymbol": benchmark_symbol,
+            "strategyVersion": "improved_v1",
+            "mae": improved_metrics["mae"],
+            "rmse": improved_metrics["rmse"],
+            "hit_rate_02": improved_metrics["hit_rate_02"],
+            "hit_rate_05": improved_metrics["hit_rate_05"],
+            "max_err": improved_metrics["max_err"],
+            "bias": improved_metrics["bias"],
+            "samples": len(improved_errors),
+            "baseline": baseline_metrics,
         }
     except Exception as e:
         logger.error(f"Backtest failed for {code}: {e}")
         return None
+    finally:
+        logger.info(f"Backtest finished for {code} in {int((time.time() - started) * 1000)}ms")
 
 
 @app.get("/backtest_report")
@@ -1215,41 +1458,44 @@ def get_backtest_report(force_refresh: bool = False):
         codes = list(user_settings_data.get("fundCodes", []))
     
     if not codes:
-        return {"date": today, "results": []}
-    
-    # 检查缓存
+        return {"date": today, "results": [], "pending": False, "total": 0, "completed": 0}
+
+    # 读取缓存快照与任务状态
     with data_lock:
         day_cache = backtest_cache_data.get(today, {})
-    if not force_refresh and day_cache:
-        # 过滤掉不在当前列表中的基金
-        cached_results = [day_cache[c] for c in codes if c in day_cache]
-        if len(cached_results) == len(codes):
-            logger.info("Returning cached backtest report")
-            return {"date": today, "results": cached_results}
-    
-    logger.info(f"Running full backtest for {len(codes)} funds...")
-    results = []
-    for code in codes:
-        res = run_single_backtest(code)
-        if res:
-            results.append(res)
-    
-    # 更新缓存
+        job_snapshot = dict(backtest_job_state)
+
+    cached_results = [day_cache[c] for c in codes if c in day_cache]
+    cached_count = len(cached_results)
+    is_complete = cached_count == len(codes)
+
+    # 满量缓存直接返回
+    if not force_refresh and is_complete:
+        logger.info("Returning cached backtest report")
+        return {
+            "date": today,
+            "results": cached_results,
+            "pending": False,
+            "total": len(codes),
+            "completed": len(codes),
+            "updatedAt": job_snapshot.get("updatedAt"),
+        }
+
+    # 不阻塞请求，转后台回测
+    ensure_backtest_job(today, codes, force_refresh)
     with data_lock:
-        if today not in backtest_cache_data:
-            backtest_cache_data[today] = {}
+        fresh_job = dict(backtest_job_state)
+        day_cache = backtest_cache_data.get(today, {})
+    cached_results = [day_cache[c] for c in codes if c in day_cache]
 
-        for res in results:
-            backtest_cache_data[today][res["code"]] = res
-
-        # 清理旧缓存（保留 7 天）
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
-        for d in list(backtest_cache_data.keys()):
-            if d < cutoff:
-                del backtest_cache_data[d]
-            
-    save_backtest_cache()
-    return {"date": today, "results": results}
+    return {
+        "date": today,
+        "results": cached_results,
+        "pending": bool(fresh_job.get("running")),
+        "total": int(fresh_job.get("total") or len(codes)),
+        "completed": int(fresh_job.get("completed") or len(cached_results)),
+        "updatedAt": fresh_job.get("updatedAt"),
+    }
 
 
 @app.get("/proxy/sina")

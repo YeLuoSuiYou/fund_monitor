@@ -11,6 +11,8 @@ export type HoldingsApiHolding = {
 export type HoldingsApiResponse = {
   code: string
   name?: string
+  fundType?: string | null
+  benchmarkSymbol?: string | null
   holdingsDate?: string
   cashRatio?: number
   baseNav?: number | null

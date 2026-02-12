@@ -9,6 +9,8 @@
 - 行业归因：按行业汇总持仓权重与贡献
 - 后端持久化：跨浏览器同步基金列表与估值点位缓存
 - 多行情源：支持新浪行情与自定义模板
+- 回测异步任务：回测报告改为后台计算，前端轮询进度，避免长请求超时
+- 策略对比回测：同窗对比 `baseline` 与 `improved_v1`（MAE/RMSE/命中率/偏置）
 
 ## 技术架构
 
@@ -72,6 +74,38 @@ uvicorn api.akshare_server:app --host 0.0.0.0 --port 8001
 - `quoteSourceId`：行情来源（sina/custom）
 - `holdingsApiBaseUrl`：后端服务地址
 
+## 实时估值策略
+
+当前默认策略为 `improved_v1`，核心思路：
+
+- 持仓驱动：基于前十大持仓与实时行情计算贡献
+- 类型感知：按基金类型动态调整“持仓贡献 vs 指数代理”权重
+- 时效衰减：持仓报告越旧，越降低持仓贡献权重，减少季报滞后误差
+- 安全回退：若缺关键行情，自动回退到可用代理路径，不阻断展示
+
+说明：所有策略都保留 `baseline` 对照，避免无对比迭代。
+
+## 回测报告机制
+
+- 接口：`GET /backtest_report`
+- 行为：优先返回当前缓存结果；如需重算（`force_refresh=true`），后端启动后台任务并返回进度
+- 返回字段（核心）：
+  - `results`：当前已完成结果
+  - `pending`：是否仍在后台计算
+  - `total` / `completed`：进度统计
+  - `updatedAt`：最近更新时间
+
+前端回测页会自动轮询进度，直到任务完成。
+
+## 策略优化规范（防未来函数与过拟合）
+
+项目内置了优化规范 skill：`.cursor/skills/backtest-strategy-optimization/SKILL.md`，用于约束迭代过程：
+
+- 严禁未来函数（look-ahead bias）
+- 禁止按单基金单独调参后直接全局上线
+- 必须保留 baseline 并做同窗 A/B 对比
+- 不满足指标门槛时回滚策略
+
 ## 缓存与本地数据
 
 以下文件为本地缓存与用户配置，已加入 `.gitignore`，不建议提交：
@@ -79,6 +113,8 @@ uvicorn api.akshare_server:app --host 0.0.0.0 --port 8001
 - `cache.json`：后端请求缓存
 - `intraday_history.json`：日内估值历史点位
 - `user_settings.json`：基金列表与用户配置
+- `backtest_cache.json`：回测结果缓存
+- `api/accuracy_history.json`：来源准确度历史
 
 ## 常见问题
 
