@@ -18,7 +18,7 @@ describe("buildFundEstimate", () => {
 
     expect(estimate.gszzl).not.toBeNull()
     expect(estimate.benchmarkSymbol).toBe("sh000300")
-    expect(estimate.strategyVersion).toBe("improved_v1")
+    expect(estimate.strategyVersion).toBe("adaptive_v2")
     // 1% * 95% = 0.95%
     expect(estimate.gszzl as number).toBeCloseTo(0.95, 2)
   })

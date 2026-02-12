@@ -45,9 +45,9 @@ function inferBenchmarkSymbol(name?: string, fundType?: string | null): string {
 
 function inferHoldingsWeight(fundType?: string | null): number {
   const text = String(fundType ?? "")
-  if (/指数|ETF/.test(text)) return 0.25
-  if (/混合/.test(text)) return 0.65
-  return 0.8
+  if (/指数|ETF/.test(text)) return 0.55
+  if (/混合/.test(text)) return 0.95
+  return 0.95
 }
 
 function parseHoldingsDateToTs(label?: string): number | null {
@@ -111,15 +111,16 @@ export function buildFundEstimate(params: {
 
   const holdingsDrivenReturn = matchedWeight > 0 ? (matchedReturnContribution / matchedWeight) * equityRatio : null
   const benchmarkSymbol = params.benchmarkSymbol ?? inferBenchmarkSymbol(params.name, params.fundType)
+  const isIndexFund = /指数|ETF/.test(String(params.fundType ?? ""))
   const proxyStockReturn = Number.isFinite(params.benchmarkReturn as number)
     ? (params.benchmarkReturn as number)
     : (matchedWeight > 0 ? matchedReturnContribution / matchedWeight : 0)
   const proxyDrivenReturn = proxyStockReturn * equityRatio
 
   const freshness = computeFreshnessFactor(params.holdingsDate)
-  const holdingsWeightBase = inferHoldingsWeight(params.fundType)
+  const holdingsWeightBase = isIndexFund ? inferHoldingsWeight(params.fundType) : 1
   const holdingsWeight = holdingsDrivenReturn === null ? 0 : holdingsWeightBase * freshness
-  const proxyWeight = 1 - holdingsWeight
+  const proxyWeight = isIndexFund ? 1 - holdingsWeight : 0
 
   let finalReturn = holdingsDrivenReturn === null
     ? proxyDrivenReturn
@@ -153,6 +154,6 @@ export function buildFundEstimate(params: {
     quoteTime: latestQuoteTime || null,
     fundType: params.fundType ?? null,
     benchmarkSymbol,
-    strategyVersion: params.strategyVersion ?? "improved_v1",
+    strategyVersion: params.strategyVersion ?? "adaptive_v2",
   }
 }

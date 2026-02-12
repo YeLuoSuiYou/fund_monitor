@@ -1,4 +1,5 @@
 import logging
+import concurrent.futures
 import pandas as pd
 import numpy as np
 import json
@@ -59,6 +60,8 @@ user_settings_data = {} # 存储基金列表等用户配置
 intraday_history_data = {} # 存储日内估值点 { code: { date: [ { time, value } ] } }
 data_lock = threading.Lock()
 ak_lock = threading.Lock() # 专门用于保护 akshare 调用，防止 mini_racer 崩溃
+AK_CALL_TIMEOUT_SEC = 12
+BACKTEST_FUND_TIMEOUT_SEC = 60
 
 class UserSettingsPayload(BaseModel):
     fundCodes: List[str] = Field(default_factory=list)
@@ -145,17 +148,35 @@ def call_ak(func, *args, **kwargs):
     """
     带锁调用 akshare 接口，确保线程安全并防止 V8 崩溃
     """
+    max_retries = 2
     with ak_lock:
-        started = time.time()
-        try:
-            result = func(*args, **kwargs)
-            elapsed_ms = int((time.time() - started) * 1000)
-            if elapsed_ms > 1500:
-                logger.info(f"akshare slow call ({func.__name__}): {elapsed_ms}ms")
-            return result
-        except Exception as e:
-            logger.error(f"akshare call error ({func.__name__}): {e}")
-            return None
+        for attempt in range(max_retries + 1):
+            started = time.time()
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(func, *args, **kwargs)
+                try:
+                    result = future.result(timeout=AK_CALL_TIMEOUT_SEC)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                elapsed_ms = int((time.time() - started) * 1000)
+                if elapsed_ms > 1500:
+                    logger.info(f"akshare slow call ({func.__name__}): {elapsed_ms}ms")
+                return result
+            except concurrent.futures.TimeoutError:
+                is_last = attempt >= max_retries
+                if is_last:
+                    logger.error(f"akshare call timeout ({func.__name__}) after {AK_CALL_TIMEOUT_SEC}s")
+                    return None
+                logger.warning(f"akshare timeout ({func.__name__}) retry {attempt + 1}/{max_retries}")
+                time.sleep(0.2 * (attempt + 1))
+            except Exception as e:
+                is_last = attempt >= max_retries
+                if is_last:
+                    logger.error(f"akshare call error ({func.__name__}): {e}")
+                    return None
+                logger.warning(f"akshare transient error ({func.__name__}) retry {attempt + 1}/{max_retries}: {e}")
+                time.sleep(0.2 * (attempt + 1))
 
 def load_persistent_cache():
     global cache_store, fund_info_cache, stock_info_cache, user_settings_data, intraday_history_data
@@ -247,7 +268,17 @@ def run_backtest_job(today: str, codes: List[str], force_refresh: bool):
     logger.info(f"Backtest job started for {len(codes)} funds (date={today}, force={force_refresh})")
     save_counter = 0
     for code in codes:
-        res = run_single_backtest(code)
+        res = None
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(run_single_backtest, code)
+        try:
+            res = future.result(timeout=BACKTEST_FUND_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            logger.error(f"Backtest timeout for {code}, skipped after {BACKTEST_FUND_TIMEOUT_SEC}s")
+        except Exception as e:
+            logger.error(f"Backtest execution error for {code}: {e}")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         with data_lock:
             if today not in backtest_cache_data:
                 backtest_cache_data[today] = {}
@@ -1269,10 +1300,10 @@ def compute_holdings_freshness(holdings_date: Optional[str], target_date: date) 
 def infer_holdings_weight_by_type(fund_type: Optional[str]) -> float:
     text = str(fund_type or "")
     if "指数" in text or "ETF" in text:
-        return 0.25
+        return 0.55
     if "混合" in text:
-        return 0.65
-    return 0.8
+        return 0.95
+    return 0.95
 
 
 def fetch_index_returns(symbol: str, start_date: str, end_date: str) -> Dict[date, float]:
@@ -1330,6 +1361,7 @@ def run_single_backtest(code: str, days=30):
         profile = get_fund_profile(code)
         benchmark_symbol = profile.get("benchmarkSymbol", "sh000300")
         fund_type = profile.get("fundType")
+        is_index_fund = ("指数" in str(fund_type or "")) or ("ETF" in str(fund_type or ""))
 
         cash_ratio, _ = parse_cash_ratio(code)
         cash_ratio = (cash_ratio or 0) / 100
@@ -1354,6 +1386,7 @@ def run_single_backtest(code: str, days=30):
         end_date = df_nav[col_date].max().strftime("%Y%m%d")
 
         stock_histories = {}
+        total_holdings_weight = sum(float(h.get("weight", 0)) for h in holdings_data["holdings"])
         for h in holdings_data["holdings"]:
             symbol = h["symbol"]
             df_s = None
@@ -1404,6 +1437,9 @@ def run_single_backtest(code: str, days=30):
 
             if matched_w <= 0:
                 continue
+            if total_holdings_weight > 0 and (matched_w / total_holdings_weight) < 0.35:
+                # 覆盖率太低时误差噪声很大，跳过该样本日，避免污染回测结论
+                continue
 
             baseline_est = (contrib / matched_w) * equity_ratio * 100
             baseline_diff = baseline_est - actual
@@ -1415,9 +1451,9 @@ def run_single_backtest(code: str, days=30):
             proxy_est = proxy_ret * equity_ratio * 100
 
             freshness = compute_holdings_freshness(holdings_data.get("holdingsDate"), d.date())
-            holdings_weight = infer_holdings_weight_by_type(fund_type) * freshness
+            holdings_weight = (infer_holdings_weight_by_type(fund_type) if is_index_fund else 1.0) * freshness
             holdings_weight = max(0, min(1, holdings_weight))
-            improved_est = baseline_est * holdings_weight + proxy_est * (1 - holdings_weight)
+            improved_est = baseline_est * holdings_weight + proxy_est * (1 - holdings_weight if is_index_fund else 0)
 
             improved_diff = improved_est - actual
             improved_diffs.append(improved_diff)
@@ -1434,7 +1470,7 @@ def run_single_backtest(code: str, days=30):
             "name": profile.get("name") or get_fund_name(code),
             "fundType": fund_type,
             "benchmarkSymbol": benchmark_symbol,
-            "strategyVersion": "improved_v1",
+            "strategyVersion": "adaptive_v2",
             "mae": improved_metrics["mae"],
             "rmse": improved_metrics["rmse"],
             "hit_rate_02": improved_metrics["hit_rate_02"],

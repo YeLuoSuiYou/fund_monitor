@@ -467,10 +467,10 @@ export const useFundStore = create<FundStore>()(
           config.benchmarkSymbol && quotes[config.benchmarkSymbol] && quotes[config.benchmarkSymbol].prevClose > 0
             ? (quotes[config.benchmarkSymbol].price - quotes[config.benchmarkSymbol].prevClose) / quotes[config.benchmarkSymbol].prevClose
             : null,
-        strategyVersion: "improved_v1",
+        strategyVersion: "adaptive_v2",
       })
-      if (estimate.coverage <= 0) {
-        const msg = "行情缺失"
+      if (estimate.coverage < 0.35) {
+        const msg = estimate.coverage <= 0 ? "行情缺失" : "行情覆盖不足"
         if (!anyErrorMessage) anyErrorMessage = msg
         error += 1
         nextFunds[code] = {
